@@ -1,0 +1,25 @@
+dataset: dim/mt_bench_en
+name: default
+column: turns
+
+start_ops:
+  - op0
+end_ops:
+  - op1
+
+ops:
+  op0:
+    model: meta-llama/Llama-3.1-8B-Instruct
+    prompt: "Please try to answer the question with multi-step Chain of Thought."
+    max_tokens: 1024
+    input_ops: []
+    output_ops:
+      - op1
+
+  op1:
+    model: meta-llama/Llama-3.1-8B-Instruct
+    prompt: "Please answer the next question based on the previous context and your own reasoning."
+    max_tokens: 1024
+    input_ops:
+      - op0
+    output_ops: []

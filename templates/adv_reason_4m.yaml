@@ -1,0 +1,43 @@
+dataset: openai/gsm8k
+name: main
+column: question
+
+start_ops:
+  - op0
+end_ops:
+  - op3
+
+ops:
+  op0:
+    model: meta-llama/Llama-3.2-3B-Instruct
+    prompt: "Please answer the question in brief sentences."
+    max_tokens: 1024
+    input_ops: []
+    output_ops:
+      - op1
+
+  op1:
+    model: meta-llama/Llama-3.2-3B-Instruct
+    prompt: "Please rethink and answer the question again."
+    max_tokens: 1024
+    input_ops:
+      - op0
+    output_ops:
+      - op2
+
+  op2:
+    model: meta-llama/Llama-3.1-8B-Instruct
+    prompt: "Please give your final answer considering the critique before."
+    max_tokens: 1024
+    input_ops:
+      - op1
+    output_ops:
+      - op3
+
+  op3:
+    model: meta-llama/Llama-3.1-8B-Instruct
+    prompt: "Please give your final answer considering the critique before."
+    max_tokens: 1024
+    input_ops:
+      - op2
+    output_ops: []
