@@ -1,0 +1,89 @@
+graph:
+  name: example_diamond_multiperspective
+  description: >
+    Fan-out / fan-in DAG (vLLM only, no DB). One question is answered from three
+    independent perspectives in parallel, then a larger model fuses the drafts
+    into a single grounded answer. Demonstrates a real DAG (diamond) rather than
+    a linear chain: the three branch nodes can be scheduled concurrently across
+    workers, and all converge on the aggregator.
+
+  nodes:
+    - id: user_input
+      type: input
+      outputs:
+        - user_query
+
+    # ===== Parallel perspective branches (fan-out) =====
+    - id: factual_view
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-1.7B
+      system_prompt: |
+        Answer the question focusing strictly on verifiable facts.
+        Be concise and avoid speculation.
+      inputs:
+        - user_query
+      outputs:
+        - factual_view
+
+    - id: analytical_view
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-1.7B
+      system_prompt: |
+        Answer the question by reasoning through cause and effect.
+        Highlight trade-offs and underlying mechanisms.
+      inputs:
+        - user_query
+      outputs:
+        - analytical_view
+
+    - id: critical_view
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-0.6B
+      system_prompt: |
+        Play devil's advocate: list the most important caveats, edge cases,
+        or counterarguments relevant to the question.
+      inputs:
+        - user_query
+      outputs:
+        - critical_view
+
+    # ===== Fusion (fan-in) =====
+    - id: aggregator
+      type: inference
+      engine: vllm
+      model: meta-llama/Llama-3.1-8B-Instruct
+      system_prompt: |
+        You are given three independent takes on a question: a factual view,
+        an analytical view, and a critical view. Reconcile them into one clear,
+        balanced, and well-grounded final answer.
+      inputs:
+        - user_query
+        - factual_view
+        - analytical_view
+        - critical_view
+      outputs:
+        - final_answer
+
+  edges:
+    # fan-out: the input feeds all three branches
+    - {from: user_input, to: factual_view,    mapping: {user_query: "{{ user_query }}"}}
+    - {from: user_input, to: analytical_view, mapping: {user_query: "{{ user_query }}"}}
+    - {from: user_input, to: critical_view,   mapping: {user_query: "{{ user_query }}"}}
+
+    # fan-in: every branch converges on the aggregator
+    - from: factual_view
+      to: aggregator
+      mapping:
+        user_query: "{{ user_query }}"
+        factual_view: "{{ factual_view }}"
+    - from: analytical_view
+      to: aggregator
+      mapping:
+        analytical_view: "{{ analytical_view }}"
+    - from: critical_view
+      to: aggregator
+      mapping:
+        critical_view: "{{ critical_view }}"

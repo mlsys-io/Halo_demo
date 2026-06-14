@@ -1,192 +1,108 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Unified benchmark runner (clean version, only halo_v and halo_t).
+Batch inference runner for Halo.
 
-- Single CLI to run different optimizers.
-- Loads a YAML template to fetch dataset spec and builds batched requests.
-- Runs the selected optimizer and prints summary stats.
+Parses a declarative graph template, builds an optimized execution plan with the
+chosen scheduler (DP by default), then runs a batch of queries through the
+multi-process processor and prints throughput / latency.
+
+Examples
+--------
+    python scripts/batch_inference.py --template templates/example_chain.yaml -n 64
+    python scripts/batch_inference.py --scheduler greedy --gpus 4 --input-file queries.txt
 """
 
 from __future__ import annotations
 
-import os
-import time
 import argparse
-from typing import List, Tuple, Dict, Any
+import time
+from pathlib import Path
+from typing import List
 
-import torch
-import yaml
-from datasets import load_dataset, concatenate_datasets
-
-from halo.components import Query
+from halo import GraphTemplateParser, GraphOptimizer, MultiProcessGraphProcessor
 
 
-# -------------------------------------------------------------------
-# Optimizer Loader
-# -------------------------------------------------------------------
-
-def load_optimizer(name: str):
-    """
-    Lazy-import and return an optimizer class/factory by name.
-    The returned object must be callable like: optimizer_fun(template_path) -> optimizer_instance
-    """
-    name = name.lower().strip()
-
-    if name == "halo_v":
-        from halo.optimizers import Optimizer_v as opt
-        return opt
-    if name == "halo_t":
-        from halo.optimizers import Optimizer_t as opt
-        return opt
-
-    raise ValueError(f"Unknown optimizer: {name}")
+# A few canned prompts, repeated to reach the requested batch size when no
+# --input-file is given.
+_SAMPLE_QUERIES = [
+    "What is a machine learning system?",
+    "Explain prefix caching in LLM serving.",
+    "Why does batching improve GPU utilization?",
+    "Summarize the trade-offs of speculative decoding.",
+]
 
 
-# -------------------------------------------------------------------
-# Dataset & Request Preparation
-# -------------------------------------------------------------------
-
-def load_and_prepare_dataset(template_path: str, num_requests: int) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """
-    Load the YAML template for dataset spec, fetch the split via datasets.load_dataset,
-    and repeat if necessary to reach num_requests.
-    Returns (dataset_rows_as_list_of_dicts, template_config).
-    """
-    with open(template_path, "r", encoding="utf-8") as f:
-        config = yaml.safe_load(f)
-
-    dataset = load_dataset(config["dataset"], name=config.get("name"), split="train")
-
-    if num_requests > len(dataset):
-        times = num_requests // len(dataset) + 1
-        dataset = concatenate_datasets([dataset] * times)
-
-    dataset = dataset.select(range(num_requests))
-    return list(dataset), config
-
-
-def build_requests(samples: List[Dict[str, Any]], text_key: str, max_input_len: int) -> List[Query]:
-    """
-    Build a list of Query(id, text) objects from dataset samples, extracting
-    `text_key` from each row and truncating to `max_input_len` characters.
-    """
-    requests: List[Query] = []
-    for i, row in enumerate(samples):
-        raw = row.get(text_key, "")
-        text = raw if isinstance(raw, str) else str(raw)
-        text = text[:max_input_len] if max_input_len and max_input_len > 0 else text
-        requests.append(Query(i, text))
-    return requests
-
-
-# -------------------------------------------------------------------
-# Benchmark Summary
-# -------------------------------------------------------------------
-
-def summarize_benchmarks(opt) -> None:
-    """
-    Print per-operator (or per-node) average timings.
-    Compatible with both 'opt.ops' and 'opt.nodes' attributes.
-    Expects each item to expose a .benchmark dict or object with:
-      init_time, prefill_time, generate_time.
-    """
-    # Collect Operator/Node objects
-    items = None
-    if hasattr(opt, "ops"):
-        items = list(getattr(opt, "ops").values())
-    elif hasattr(opt, "nodes"):
-        items = list(getattr(opt, "nodes").values())
+def load_queries(input_file: str | None, num_queries: int) -> List[str]:
+    """Build `num_queries` query strings, from a file (one per line) or samples."""
+    if input_file:
+        lines = [
+            ln.strip()
+            for ln in Path(input_file).read_text(encoding="utf-8").splitlines()
+            if ln.strip() and not ln.startswith("#")
+        ]
+        pool = lines or _SAMPLE_QUERIES
     else:
-        print("[WARN] Optimizer has neither 'ops' nor 'nodes'; skipping per-operator summary.")
-        return
+        pool = _SAMPLE_QUERIES
+    return [pool[i % len(pool)] for i in range(num_queries)]
 
-    if not items:
-        print("[WARN] No operators/nodes found in optimizer; skipping summary.")
-        return
-
-    def _get_val(bm, key: str) -> float:
-        # Support dict-style benchmark or object-style attributes
-        if isinstance(bm, dict):
-            return float(bm.get(key, 0.0))
-        return float(getattr(bm, key, 0.0))
-
-    init_times, prefill_times, generate_times = [], [], []
-    for it in items:
-        bm = getattr(it, "benchmark", {})
-        init_times.append(_get_val(bm, "init_time"))
-        prefill_times.append(_get_val(bm, "prefill_time"))
-        generate_times.append(_get_val(bm, "generate_time"))
-
-    def _avg(xs: List[float]) -> float:
-        return (sum(xs) / len(xs)) if xs else 0.0
-
-    print("[OPTIMIZER] Operator benchmark (avg ms):")
-    print(f"  init_time:     {_avg(init_times):.2f}")
-    print(f"  prefill_time:  {_avg(prefill_times):.2f}")
-    print(f"  generate_time: {_avg(generate_times):.2f}")
-
-
-# -------------------------------------------------------------------
-# Main CLI
-# -------------------------------------------------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Clean benchmark runner (only halo_v and halo_t)"
-    )
-    parser.add_argument(
-        "--optimizer",
-        type=str,
-        choices=["halo_v", "halo_t"],
-        default="halo_v",
-        help="Choose optimizer to benchmark (default: halo_v)",
-    )
+    parser = argparse.ArgumentParser(description="Halo batch inference runner")
     parser.add_argument(
         "--template",
         type=str,
-        default="templates/adv_reason_3.yaml",
-        help="Path to YAML template",
+        default="templates/example_chain.yaml",
+        help="Path to the YAML graph template",
     )
     parser.add_argument(
-        "-n",
-        "--num_queries",
-        type=int,
-        default=250,
-        help="Number of queries to process (default: 250)",
+        "--scheduler",
+        type=str,
+        default="dp",
+        choices=["dp", "rr_topo", "random_topo", "model_first", "greedy", "minswitch", "milp", "auto"],
+        help="Optimizer scheduler mode (default: dp)",
     )
     parser.add_argument(
-        "--max_input_length",
-        type=int,
-        default=256,
-        help="Maximum input length per request (default: 256)",
+        "--plan-mode",
+        type=str,
+        default="default",
+        choices=["default", "profiled", "baseline"],
+        help="'profiled' enables SQL EXPLAIN profiling (needs Postgres); 'default' skips it",
     )
-
+    parser.add_argument("--gpus", type=int, default=None, help="Override detected GPU count")
+    parser.add_argument("--cpu-workers", type=int, default=1, help="CPU workers for DB nodes")
+    parser.add_argument("-n", "--num-queries", type=int, default=64, help="Batch size to run")
+    parser.add_argument("--input-file", type=str, default=None, help="Optional file: one query per line")
     args = parser.parse_args()
 
-    # Instantiate optimizer
-    optimizer_fun = load_optimizer(args.optimizer)
-    print(f"[INFO] Using optimizer: {args.optimizer}")
+    graph = GraphTemplateParser(args.template).parse()
+    queries = load_queries(args.input_file, args.num_queries)
+    contexts = [{"user_query": q} for q in queries]
 
-    # Load dataset and build Query objects
-    samples, cfg = load_and_prepare_dataset(args.template, args.num_queries)
-    column = cfg["column"]
-    opt = optimizer_fun(args.template)
-    requests = build_requests(samples, column, args.max_input_length)
+    optimizer = GraphOptimizer(
+        num_gpus=args.gpus,
+        num_cpu_workers=args.cpu_workers,
+        scheduler_mode=args.scheduler,
+        plan_mode=args.plan_mode,
+    )
 
-    # Run benchmark
     t0 = time.perf_counter()
-    total_time = opt.execute(requests)
+    plan = optimizer.build_plan(graph, sample_contexts=contexts[:1], input_query_count=len(queries))
     t1 = time.perf_counter()
+    print(f"[PLAN] scheduler={args.scheduler} build_plan={t1 - t0:.3f}s tasks={len(plan.tasks)}")
+    for task in plan.tasks:
+        print(f"  node={task.node_id!r} worker={task.worker_id!r} epoch={getattr(task, 'epoch', None)}")
 
-    # Print summary
-    print(f"[OPTIMIZER] End-to-end time (optimizer): {total_time:.4f}s")
-    print(f"[OPTIMIZER] Wall-clock measured:        {(t1 - t0):.4f}s")
-    summarize_benchmarks(opt)
+    processor = MultiProcessGraphProcessor(persistent_workers=True)
+    try:
+        t2 = time.perf_counter()
+        results = processor.run_batch(plan, graph, contexts)
+        t3 = time.perf_counter()
+    finally:
+        processor.close()
 
-    # Cleanup
-    opt.exit()
-    torch.cuda.empty_cache()
+    exec_s = max(t3 - t2, 1e-6)
+    print(f"[RUN] batch={len(queries)} exec={exec_s:.3f}s throughput={len(queries) / exec_s:.2f} q/s")
 
 
 if __name__ == "__main__":

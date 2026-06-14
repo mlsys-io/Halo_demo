@@ -13,7 +13,7 @@ Here is the prototype for Halo, a novel system that unifies LLM serving with que
 to efficiently process batch agentic workflows.
 
 <div style="text-align: center;">
-    <img src="figs/overview.png" alt="示例图片" width="400" height="200">
+    <img src="figs/overview.png" alt="Halo overview" width="640">
 </div>
 
 We identify key features in our design:
@@ -37,50 +37,73 @@ uv sync
 source .venv/bin/activate
 ```
 
+Pure-LLM workflows need nothing more. Workflows that attach SQL `db_queries`
+to a node additionally require a Postgres backend — install that extra with
+`uv sync --extra postgres`.
+
+> The DP scheduler has an optional Rust core in the full research build. This
+> demo ships the pure-Python implementation only; the DP solver automatically
+> falls back to Python, producing identical plans.
+
 ## Usage
-1. Build a declarative YAML configuration file for your workflow. Example:
+1. Describe your workflow as a declarative graph (`templates/example_chain.yaml`).
+A graph has typed `nodes` (an `input` node plus `inference` nodes with
+`engine: vllm`) and `edges` that map one node's outputs into the next node's
+inputs:
 ```yaml
-start_ops:
-  - op0
-end_ops:
-  - op1
-
-ops:
-  op0:
-    model: meta-llama/Llama-3.2-3B-Instruct
-    prompt: "Please try to answer the question with multi-step Chain of Thought."
-    max_tokens: 512
-    input_ops: []
-    output_ops:
-      - op1
-
-  op1:
-    model: meta-llama/Llama-3.1-8B-Instruct
-    prompt: "Please answer the question again based on the previous context and your own reasoning."
-    max_tokens: 1024
-    input_ops:
-      - op0
-    output_ops: []
-
+graph:
+  name: example_two_stage_cot
+  nodes:
+    - id: user_input
+      type: input
+      outputs: [user_query]
+    - id: reason
+      type: inference
+      engine: vllm
+      model: meta-llama/Llama-3.2-3B-Instruct
+      system_prompt: "Answer with multi-step chain-of-thought reasoning."
+      inputs: [user_query]
+      outputs: [reasoning]
+    - id: answer
+      type: inference
+      engine: vllm
+      model: meta-llama/Llama-3.1-8B-Instruct
+      system_prompt: "Using the prior reasoning, give a concise final answer."
+      inputs: [user_query, reasoning]
+      outputs: [final_answer]
+  edges:
+    - {from: user_input, to: reason,  mapping: {user_query: "{{ user_query }}"}}
+    - {from: reason,     to: answer,  mapping: {user_query: "{{ user_query }}", reasoning: "{{ reasoning }}"}}
 ```
-2. Create your queries
+A node may also carry `db_queries` (SQL with `:named` parameters); Halo splits
+those into standalone CPU nodes and schedules them alongside the LLM nodes.
+
+2. Parse the graph, build an optimized execution plan, and run a batch:
 ```python
-from halo.components import Query
-queries = [
-    Query(
-        id = 0,
-        prompt = "What is the capital of France?",
-    )
-    ...
-]
-```
-3. Execute with Halo's optimizer
-```python
-from halo.optimizers import Optimizer_v
+from halo import GraphTemplateParser, GraphOptimizer, MultiProcessGraphProcessor
 
-optimizer = Optimizer_v(YAML_CONFIG_PATH)
-queries = optimizer.execute(queries, return_queries=True)
+# 1) Parse the declarative workflow into a typed graph
+graph = GraphTemplateParser("templates/example_chain.yaml").parse()
+
+# 2) Optimize: a single-pass DP picks node order, worker placement, and query
+#    order, tracking model/cache reuse. scheduler_mode also accepts
+#    "rr_topo", "model_first", "greedy", "minswitch", "milp", or "auto".
+optimizer = GraphOptimizer(num_gpus=2, scheduler_mode="dp", plan_mode="default")
+plan = optimizer.build_plan(graph, sample_contexts=[{"user_query": "What is a machine learning system?"}])
+
+# 3) Execute the plan over a batch of queries (one context dict per query)
+queries = ["What is a machine learning system?", "Explain prefix caching."]
+processor = MultiProcessGraphProcessor(persistent_workers=True)
+results = processor.run_batch(plan, graph, [{"user_query": q} for q in queries])
+processor.close()
+
+for q, ctx in zip(queries, results):
+    print(q, "->", ctx.get("final_answer"))
 ```
+`build_plan` (planning) runs on CPU; `run_batch` (execution) needs the GPUs and
+model weights for the `vllm` nodes. With `plan_mode="profiled"` and `db_queries`
+present, planning also profiles SQL via `EXPLAIN`, which requires Postgres.
+
 ## Citation
 If you find this project useful, please consider citing our work:
 ```bib

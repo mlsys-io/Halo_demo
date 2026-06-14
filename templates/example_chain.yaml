@@ -1,0 +1,48 @@
+graph:
+  name: example_two_stage_cot
+  description: >
+    Minimal two-stage chain-of-thought workflow (vLLM only, no DB).
+    A small model drafts step-by-step reasoning, then a larger model
+    produces the final answer using that reasoning as context.
+
+  nodes:
+    - id: user_input
+      type: input
+      outputs:
+        - user_query
+
+    - id: reason
+      type: inference
+      engine: vllm
+      model: meta-llama/Llama-3.2-3B-Instruct
+      system_prompt: |
+        Answer the question with multi-step chain-of-thought reasoning.
+        Show your intermediate steps clearly.
+      inputs:
+        - user_query
+      outputs:
+        - reasoning
+
+    - id: answer
+      type: inference
+      engine: vllm
+      model: meta-llama/Llama-3.1-8B-Instruct
+      system_prompt: |
+        Using the prior reasoning, give a single concise final answer.
+      inputs:
+        - user_query
+        - reasoning
+      outputs:
+        - final_answer
+
+  edges:
+    - from: user_input
+      to: reason
+      mapping:
+        user_query: "{{ user_query }}"
+
+    - from: reason
+      to: answer
+      mapping:
+        user_query: "{{ user_query }}"
+        reasoning: "{{ reasoning }}"
