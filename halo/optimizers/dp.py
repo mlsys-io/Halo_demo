@@ -548,6 +548,13 @@ class DPSolver:
         payload.cpu_dep_counts = [
             float(self._cpu_dep_counts.get(nid, 0)) for nid in self.node_ids
         ]
+        cpu_ids = set(self._db_node_ids)
+        payload.cpu_cost_estimates = [
+            float(self._cpu_cost_estimate(nid)) if nid in cpu_ids else 0.0 for nid in self.node_ids
+        ]
+        fixed = [self._fixed_cpu_cost(self.graph.nodes[nid]) if nid in cpu_ids else None for nid in self.node_ids]
+        payload.fixed_cpu_costs = [-1.0 if cost is None else float(cost) for cost in fixed]
+        payload.cpu_sink_closure = sorted(self.node_index[nid] for nid in self._cpu_sink_closure)
 
         # State encoding.
         payload.initial_worker_states = [

@@ -73,6 +73,12 @@ class RustPayload:
     """epoch_penalties[i] = epoch_penalty_fn(i) for i in 0..|nodes|."""
     cpu_dep_counts: List[float] = field(default_factory=list)
     """|DB ancestors| per GPU node; used when cpu_cost_mode == 'naive'."""
+    cpu_cost_estimates: List[float] = field(default_factory=list)
+    """Per-node CPU cost estimate used to balance CPU workers (0 for GPU nodes)."""
+    fixed_cpu_costs: List[float] = field(default_factory=list)
+    """Per-node profiled latency of HTTP / processor nodes; -1 for DB / GPU nodes."""
+    cpu_sink_closure: List[int] = field(default_factory=list)
+    """CPU sink nodes (feeding no LLM node) and their CPU ancestors."""
 
     # --- state encoding ---------------------------------------------------
     initial_worker_states: List[Dict[str, int]] = field(default_factory=list)
