@@ -9,6 +9,8 @@ import threading
 from datetime import datetime
 import re
 import time
+import urllib.parse
+import urllib.request
 from typing import Any, Callable, Dict, List, Mapping, Sequence
 from decimal import Decimal
 from collections import OrderedDict
@@ -749,7 +751,13 @@ class DBNodeExecutor(_BaseExecutor):
 
 @dataclass(slots=True)
 class HTTPNodeExecutor(_BaseExecutor):
-    """Simulates HTTP nodes by sleeping for a configured duration."""
+    """Executes HTTP nodes.
+
+    A node that declares a ``url`` and no latency key issues the templated request
+    live (e.g. an API-served LLM call to an OpenAI-compatible endpoint); a node that
+    declares a latency (``sleep_s``, ``latency_ms``, ...) is served by latency
+    injection, a Gamma-distributed sleep around that mean, for reproducible runs.
+    """
 
     http_concurrency: int = 32
     default_sleep_s: float = 0.0
@@ -792,6 +800,9 @@ class HTTPNodeExecutor(_BaseExecutor):
         return outputs
 
     def _execute_http_once(self, node: Node, context: Mapping[str, Any]) -> Dict[str, Any]:
+        raw = node.raw if isinstance(node.raw, Mapping) else {}
+        if raw.get("url") and not any(key in raw for key, _ in HTTP_LATENCY_KEYS):
+            return self._execute_live(node, raw, context)
         mean_sleep_s = self._resolve_sleep_seconds(node, context)
         sleep_s = self._sample_sleep_seconds(mean_sleep_s)
         start_time = time.perf_counter()
@@ -799,6 +810,41 @@ class HTTPNodeExecutor(_BaseExecutor):
             time.sleep(sleep_s)
         self._record_api_time(time.perf_counter() - start_time, count=1)
         return self._build_outputs(node, sleep_s)
+
+    def _execute_live(self, node: Node, raw: Mapping[str, Any], context: Mapping[str, Any]) -> Dict[str, Any]:
+        """Issue the node's request: ``url`` with optional ``method``, ``params``/``query``,
+        ``headers``, ``json``/``body`` (all templated), ``timeout_s``, and ``response_path``
+        (a dotted path into the JSON response, e.g. ``choices.0.message.content``)."""
+        request = {key: _render_nested(raw[key], context) for key in _HTTP_REQUEST_FIELDS if key in raw}
+        url = str(request["url"])
+        params = request.get("params", request.get("query"))
+        if params:
+            url += ("&" if "?" in url else "?") + urllib.parse.urlencode(params, doseq=True)
+        headers = {str(k): str(v) for k, v in (request.get("headers") or {}).items()}
+        data = None
+        if "json" in request:
+            data = json.dumps(request["json"]).encode("utf-8")
+            if not any(k.lower() == "content-type" for k in headers):
+                headers["Content-Type"] = "application/json"
+        elif "body" in request:
+            body = request["body"]
+            data = (body if isinstance(body, str) else json.dumps(body)).encode("utf-8")
+        method = str(request.get("method") or ("POST" if data is not None else "GET")).upper()
+        start_time = time.perf_counter()
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        with urllib.request.urlopen(req, timeout=float(raw.get("timeout_s", 60))) as response:
+            text = response.read().decode(response.headers.get_content_charset() or "utf-8")
+        self._record_api_time(time.perf_counter() - start_time, count=1)
+        payload = maybe_parse_json(text)
+        if raw.get("response_path"):
+            payload = lookup_path(payload, str(raw["response_path"]), default=None)
+        if not node.outputs:
+            return {}
+        if len(node.outputs) == 1:
+            return {node.outputs[0]: payload}
+        if isinstance(payload, Mapping):
+            return {name: payload.get(name) for name in node.outputs}
+        return {name: copy.deepcopy(payload) for name in node.outputs}
 
     def _resolve_sleep_seconds(self, node: Node, context: Mapping[str, Any]) -> float:
         seconds = http_latency_seconds(node.raw or {}, render=lambda v: render_template(v, context))

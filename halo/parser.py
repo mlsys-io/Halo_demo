@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 
@@ -31,6 +32,7 @@ class GraphTemplateParser:
         description = graph_data.get("description", "")
         nodes = self._parse_nodes(graph_data.get("nodes", []))
         edges = self._parse_edges(graph_data.get("edges", []))
+        nodes, edges = self._unroll_loops(nodes, edges, graph_data.get("loops", []))
         nodes, edges = self._expand_embedded_calls(nodes, edges)
         return GraphSpec(name=name, description=description, nodes=nodes, edges=edges)
 
@@ -88,6 +90,57 @@ class GraphTemplateParser:
                 raise GraphValidationError("Edge entries must have 'from' and 'to'.")
             parsed_edges.append(Edge(source=source, target=target, mapping=mapping))
         return parsed_edges
+
+    def _unroll_loops(
+        self,
+        nodes: Dict[str, Node],
+        edges: List[Edge],
+        loops: Iterable[Dict[str, Any]],
+    ) -> Tuple[Dict[str, Node], List[Edge]]:
+        """Unroll bounded loops (e.g. a critic--writer loop) into a static DAG.
+
+        A loop lists its body ``nodes`` in iteration order and a bound
+        ``max_iterations``; edges among body nodes that point backwards in that
+        order are its back edges. The body is copied once per iteration (the first
+        keeps the original ids, later copies get an ``__iter<i>`` suffix): back
+        edges link iteration i to i+1, edges into the body feed every iteration,
+        and edges out of the body leave from the last iteration.
+        """
+        for loop in loops or []:
+            body = list(loop.get("nodes", []))
+            bound = int(loop.get("max_iterations", 1))
+            missing = [node_id for node_id in body if node_id not in nodes]
+            if not body or missing or bound < 1:
+                raise GraphValidationError(
+                    f"A loop needs existing body nodes and max_iterations >= 1 (got {body}, {bound})."
+                )
+            order = {node_id: idx for idx, node_id in enumerate(body)}
+
+            def copy_id(node_id: str, it: int) -> str:
+                return node_id if it == 0 or node_id not in order else f"{node_id}__iter{it}"
+
+            def link(edge: Edge, src_it: int, dst_it: int) -> Edge:
+                return Edge(copy_id(edge.source, src_it), copy_id(edge.target, dst_it), dict(edge.mapping))
+
+            internal = [e for e in edges if e.source in order and e.target in order]
+            back = [e for e in internal if order[e.target] <= order[e.source]]
+            forward = [e for e in internal if order[e.target] > order[e.source]]
+            entering = [e for e in edges if e.source not in order and e.target in order]
+            leaving = [e for e in edges if e.source in order and e.target not in order]
+            unrolled = [e for e in edges if e.source not in order and e.target not in order]
+            nodes = dict(nodes)
+            for it in range(bound):
+                if it:
+                    for node_id in body:
+                        new_id = copy_id(node_id, it)
+                        raw = {**nodes[node_id].raw, "id": new_id} if "id" in nodes[node_id].raw else dict(nodes[node_id].raw)
+                        nodes[new_id] = replace(nodes[node_id], id=new_id, raw=raw)
+                unrolled += [link(e, it, it) for e in forward + entering]
+                if it + 1 < bound:
+                    unrolled += [link(e, it, it + 1) for e in back]
+            unrolled += [link(e, bound - 1, bound - 1) for e in leaving]
+            edges = unrolled
+        return nodes, edges
 
     def _expand_embedded_calls(
         self,

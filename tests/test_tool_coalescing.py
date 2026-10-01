@@ -493,3 +493,121 @@ def test_cpu_nodes_round_robin_without_cost_estimates(tmp_path):
     )
     cpu = {t.worker_id for t in plan.tasks if plan.workers[t.worker_id].kind == "cpu"}
     assert len(cpu) == 4
+
+
+def test_http_node_issues_live_request_and_extracts_response(monkeypatch):
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    monkeypatch.setenv("no_proxy", "*")
+    seen = []
+
+    class ChatCompletions(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            seen.append(body["messages"][0]["content"])
+            data = json.dumps({"choices": [{"message": {"content": f"re: {seen[-1]}"}}]}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), ChatCompletions)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        raw = {"url": f"http://127.0.0.1:{server.server_port}/v1/chat/completions", "method": "POST",
+               "json": {"model": "m", "messages": [{"role": "user", "content": "{{ q }}"}]},
+               "response_path": "choices.0.message.content"}
+        node = Node(id="api_llm", type="http", engine="http", model=None, inputs=("q",), outputs=("answer",),
+                    db_queries=(), raw=raw)
+        executor = HTTPNodeExecutor(http_concurrency=2)
+        outputs = executor.execute_batch(node, [{"q": "a"}, {"q": "b"}])
+        assert outputs == [{"answer": "re: a"}, {"answer": "re: b"}]  # an API-served LLM as an HTTP operator
+        assert sorted(seen) == ["a", "b"] and executor.consume_stats()["api_calls"] == 2
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_http_node_with_declared_latency_is_simulated():
+    node = _http_node(coalesce=False, url="http://127.0.0.1:9/never-contacted")
+    outputs = HTTPNodeExecutor(http_concurrency=1).execute_batch(node, [{"ticker": "AAPL"}])
+    assert outputs[0]["resp"]["status"] == "ok"  # sleep_ms keeps latency injection
+
+
+LOOP_TEMPLATE = textwrap.dedent(
+    """
+    graph:
+      name: critic_loop
+      nodes:
+        - {id: user_input, type: input, outputs: [user_query]}
+        - {id: writer, type: inference, engine: vllm, model: meta-llama/Llama-3.2-3B-Instruct,
+           inputs: [user_query, critique], outputs: [draft]}
+        - {id: critic, type: inference, engine: vllm, model: meta-llama/Llama-3.2-3B-Instruct,
+           inputs: [draft], outputs: [critique]}
+        - {id: editor, type: inference, engine: vllm, model: meta-llama/Llama-3.2-3B-Instruct,
+           inputs: [draft], outputs: [final_answer]}
+      edges:
+        - {from: user_input, to: writer}
+        - {from: writer, to: critic}
+        - {from: critic, to: writer}
+        - {from: critic, to: editor}
+      loops:
+        - {nodes: [writer, critic], max_iterations: 3}
+    """
+)
+
+
+def test_parser_unrolls_bounded_loops(tmp_path):
+    path = tmp_path / "loop.yaml"
+    path.write_text(LOOP_TEMPLATE)
+    graph = GraphTemplateParser(str(path)).parse()
+    assert set(graph.nodes) == {"user_input", "writer", "critic", "writer__iter1", "critic__iter1",
+                                "writer__iter2", "critic__iter2", "editor"}
+    assert graph.nodes["critic__iter2"].raw["id"] == "critic__iter2"
+    assert {(e.source, e.target) for e in graph.edges} == {
+        ("user_input", "writer"), ("user_input", "writer__iter1"), ("user_input", "writer__iter2"),
+        ("writer", "critic"), ("writer__iter1", "critic__iter1"), ("writer__iter2", "critic__iter2"),
+        ("critic", "writer__iter1"), ("critic__iter1", "writer__iter2"), ("critic__iter2", "editor"),
+    }
+    plan = GraphOptimizer(num_gpus=1, scheduler_mode="dp", plan_mode="default").build_plan(
+        graph, sample_contexts=[{"user_query": "q"}], input_query_count=4
+    )
+    assert {t.node_id for t in plan.tasks} >= set(graph.nodes) - {"user_input"}
+
+
+def test_tool_backpressure_caps_inflight_queries_per_cpu_worker(tmp_path, monkeypatch):
+    from halo.processors.multi_process import MultiProcessGraphProcessor
+
+    monkeypatch.setenv("HALO_MONITOR_ENABLE", "0")
+    path = tmp_path / "cpu_only.yaml"
+    path.write_text(
+        "graph:\n"
+        "  name: cpu_only\n"
+        "  nodes:\n"
+        "    - {id: user_input, type: input, outputs: [user_query]}\n"
+        "    - {id: extract, type: processor, processor: regex_param_extractor, config: {},"
+        " inputs: [user_query], outputs: [params]}\n"
+        "  edges:\n"
+        "    - {from: user_input, to: extract, mapping: {user_query: '{{ user_query }}'}}\n"
+    )
+    graph = GraphTemplateParser(str(path)).parse()
+    plan = GraphOptimizer(num_gpus=1, num_cpu_workers=1, scheduler_mode="dp", plan_mode="baseline").build_plan(
+        graph, sample_contexts=[{"user_query": "q"}], input_query_count=10
+    )
+    sizes = []
+    original = ProcessorNodeExecutor.execute_batch
+
+    def recording(self, node, contexts):
+        sizes.append(len(contexts))
+        return original(self, node, contexts)
+
+    monkeypatch.setattr(ProcessorNodeExecutor, "execute_batch", recording)
+    contexts = [{"user_query": f"q{i}"} for i in range(10)]
+    MultiProcessGraphProcessor(max_batch_size=None, max_tool_inflight=3).run_batch(plan, graph, contexts)
+    assert sizes and max(sizes) <= 3 and sum(sizes) == 10

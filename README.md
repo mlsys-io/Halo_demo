@@ -107,6 +107,16 @@ fields; `post_llm: true` runs it after the LLM on the LLM's outputs, and an
 optional `inputs` list overrides the defaults); the parser extracts them into
 standalone tool nodes, just like `db_queries`.
 
+An HTTP node that declares a `url` (with optional `method`, `params`, `headers`,
+`json`/`body`, `timeout_s`, and a `response_path` such as
+`choices.0.message.content`) issues that request live, so an API-served LLM runs
+as an opaque HTTP operator whose profiled latency enters the plan. An HTTP node
+that declares a latency (`sleep_s`, `latency_ms`, ...) is served by latency
+injection instead, as in the paper's experiments. A graph-level `loops` entry
+(e.g. `{nodes: [writer, critic], max_iterations: 3}`) unrolls a bounded loop into
+a static DAG; edges that point backwards in the listed order link each iteration
+to the next.
+
 2. Parse the graph, build an optimized execution plan, and run a batch:
 ```python
 from halo import GraphTemplateParser, GraphOptimizer, MultiProcessGraphProcessor
@@ -133,7 +143,9 @@ For online serving, `StreamingSession(optimizer, processor)` buffers submitted
 queries (`submit(graph, context)`) and `flush()` runs them in single-template
 mini-batches, re-optimizing at every mini-batch boundary.
 `MultiProcessGraphProcessor(max_batch_size="auto")` splits each operator's
-instances into two micro-batches.
+instances into two micro-batches. `max_tool_inflight=k` applies backpressure: at
+most `k` query instances are in flight per CPU (tool) worker, and further ready
+tool tasks wait in the scheduler until the backend drains (off by default).
 
 `build_plan` (planning) runs on CPU; `run_batch` (execution) needs the GPUs and
 model weights for the `vllm`/`sglang` nodes. With `plan_mode="profiled"` and `db_queries`

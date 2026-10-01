@@ -79,8 +79,12 @@ class MultiProcessGraphProcessor:
         debug_every: int = 50,
         persistent_workers: bool = False,
         enforce_epoch_barrier: bool = False,
+        max_tool_inflight: int | None = None,
     ):
         self.engine_kwargs = engine_kwargs or {}
+        # Backpressure: at most this many query instances in flight per CPU (tool)
+        # worker; further ready tool tasks wait in the scheduler. None disables it.
+        self.max_tool_inflight = None if not max_tool_inflight else max(1, int(max_tool_inflight))
         # "auto": two micro-batches per operator (ceil(N/2)), so the second half of
         # each operator's instances overlaps with the first half's downstream work.
         self._auto_batch_size = isinstance(max_batch_size, str) and max_batch_size.strip().lower() == "auto"
@@ -571,10 +575,14 @@ class MultiProcessGraphProcessor:
                     and worker_idle
                 ):
                     continue
+                batch_limit = self.max_batch_size
+                if self.max_tool_inflight is not None and worker and worker.kind != "gpu":
+                    budget = self.max_tool_inflight - worker_inflight_counts.get(assigned_worker_id, 0)
+                    if budget <= 0:
+                        continue  # backpressure: keep the task ready until the backend drains
+                    batch_limit = budget if batch_limit is None else min(batch_limit, budget)
                 batch_indices: List[int] = []
-                while ready_queue and (
-                    self.max_batch_size is None or len(batch_indices) < self.max_batch_size
-                ):
+                while ready_queue and (batch_limit is None or len(batch_indices) < batch_limit):
                     idx = ready_queue.popleft()
                     if idx in in_flight[node_id] or node_id in completed[idx]:
                         continue
