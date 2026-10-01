@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, Mapping, Sequence, Tuple
 
-from ..models import ExecutionPlan, ExecutionTask, GraphSpec, Worker, Node
+from ..models import ExecutionPlan, ExecutionTask, GraphSpec, Worker, Node, is_llm_engine, llm_model_key
 from .topo_utils import default_worker_filter, filtered_dependencies, topological_order
 
 
@@ -66,8 +66,8 @@ def build_greedy_cost_plan(
         if best_worker is None:
             raise RuntimeError(f"Unable to place node '{node_id}' on any worker.")
         load[best_worker] = load.get(best_worker, 0) + 1
-        if node.engine == "vllm":
-            last_model[best_worker] = node.model or last_model.get(best_worker)
+        if is_llm_engine(node.engine):
+            last_model[best_worker] = llm_model_key(node) or last_model.get(best_worker)
         epoch = idx // max(1, len(worker_ids))
         tasks.append(
             ExecutionTask(

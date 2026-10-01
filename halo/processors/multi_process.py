@@ -16,7 +16,7 @@ from ..db import (
     DefaultDatabaseExecutor,
     make_peer_postgres_executor,
 )
-from ..models import ExecutionPlan, ExecutionTask, GraphSpec
+from ..models import ExecutionPlan, ExecutionTask, GraphSpec, Node, is_llm_engine, llm_model_key
 from ..monitoring import ProgressMonitor, start_progress_monitor, start_system_monitor
 from ..worker import (
     ResultMessage,
@@ -31,6 +31,11 @@ _RED = "\033[31m"
 _RESET = "\033[0m"
 
 _BRIDGE_STOP = object()
+
+
+def _engine_config(epoch: int, node: Node) -> Dict[str, Any]:
+    """``__CONFIG__`` payload telling a GPU worker which model / engine to host."""
+    return {"epoch": epoch, "model": node.model or "", "engine": node.engine}
 
 
 def _gpu_result_bridge(
@@ -56,7 +61,7 @@ class MultiProcessGraphProcessor:
         * 跟踪依赖完成情况 (dependencies / dependents)
         * 按 ExecutionPlan.worker_id 将任务派发到各个 worker 进程
     - 每个 worker 进程负责：
-        * GPU worker 持有各自的 EngineProvider/vLLM cache
+        * GPU worker 持有各自的 EngineProvider/LLM 引擎（vLLM / SGLang）cache
         * CPU worker 持有 DB 执行器
     """
 
@@ -65,7 +70,7 @@ class MultiProcessGraphProcessor:
         engine_kwargs: Dict[str, Any] | None = None,
         db_connect_kwargs: Dict[str, Any] | None = None,
         db_pool_size: int | None = None,
-        max_batch_size: int | None = None,
+        max_batch_size: int | str | None = None,
         executor_kwargs: Dict[str, Any] | None = None,
         debug_log: bool = False,
         debug_every: int = 50,
@@ -73,7 +78,12 @@ class MultiProcessGraphProcessor:
         enforce_epoch_barrier: bool = False,
     ):
         self.engine_kwargs = engine_kwargs or {}
-        if max_batch_size is None:
+        # "auto": two micro-batches per operator (ceil(N/2)), so the second half of
+        # each operator's instances overlaps with the first half's downstream work.
+        self._auto_batch_size = isinstance(max_batch_size, str) and max_batch_size.strip().lower() == "auto"
+        if self._auto_batch_size:
+            self.max_batch_size = None
+        elif max_batch_size is None:
             self.max_batch_size = 32
         else:
             self.max_batch_size = int(max_batch_size)
@@ -115,6 +125,10 @@ class MultiProcessGraphProcessor:
         self._worker_lock = threading.Lock()
         self.enforce_epoch_barrier = bool(enforce_epoch_barrier)
 
+    def _resolve_batch_size(self, num_queries: int) -> None:
+        if self._auto_batch_size:
+            self.max_batch_size = max(1, (num_queries + 1) // 2)
+
     # ---- Public API ---------------------------------------------------------
 
     def run(
@@ -138,6 +152,7 @@ class MultiProcessGraphProcessor:
             return []
 
         contexts: List[Dict[str, Any]] = [dict(inputs) for inputs in initial_inputs_list]
+        self._resolve_batch_size(len(contexts))
         worker_state: tuple[Dict[str, Any], Dict[str, Any], "queue.SimpleQueue[ResultMessage]", "mp.Queue[ResultMessage]"]
         if self._persistent_workers:
             with self._worker_lock:
@@ -340,7 +355,7 @@ class MultiProcessGraphProcessor:
         llm_total_units = 0
         for task in plan.tasks:
             node = node_specs.get(task.node_id)
-            if node and node.engine == "vllm":
+            if node and is_llm_engine(node.engine):
                 llm_total_units += batch_size
             else:
                 db_total_units += batch_size
@@ -379,7 +394,7 @@ class MultiProcessGraphProcessor:
         gpu_preload_plan: Dict[str, List[str]] = {}
         for task in plan.tasks:
             node = node_specs.get(task.node_id)
-            if not node or node.engine != "vllm":
+            if not node or not is_llm_engine(node.engine):
                 continue
             assignment = task.worker_id
             wid_seq = tuple(assignment) if isinstance(assignment, (list, tuple)) else (assignment,)
@@ -398,7 +413,7 @@ class MultiProcessGraphProcessor:
                 return
             started_nodes.add(node_id)
             node = node_specs.get(node_id)
-            kind = "llm" if node and node.engine == "vllm" else "db"
+            kind = "llm" if node and is_llm_engine(node.engine) else "db"
             LOGGER.info(
                 "%s[Processor] start node=%s [%s] progress db=%d/%d llm=%d/%d total=%d/%d%s",
                 _RED,
@@ -420,7 +435,7 @@ class MultiProcessGraphProcessor:
                 return
             finished_nodes.add(node_id)
             node = node_specs.get(node_id)
-            kind = "llm" if node and node.engine == "vllm" else "db"
+            kind = "llm" if node and is_llm_engine(node.engine) else "db"
             LOGGER.info(
                 "%s[Processor] done node=%s [%s] progress db=%d/%d llm=%d/%d total=%d/%d%s",
                 _RED,
@@ -435,28 +450,29 @@ class MultiProcessGraphProcessor:
                 _RESET,
             )
 
-        # Precompute (worker_id, model) -> list of vLLM node_ids. The check
+        # Precompute (worker_id, model) -> list of LLM node_ids. The check
         # ``worker_has_ready_same_model`` is on the hot dispatch path, so doing
-        # this lookup by index is O(matching vLLM nodes) instead of O(all
-        # ready nodes) every call.
-        vllm_nodes_by_wm: Dict[tuple[str, str], List[str]] = defaultdict(list)
+        # this lookup by index is O(matching LLM nodes) instead of O(all
+        # ready nodes) every call. "model" is ``llm_model_key`` (engine-qualified
+        # for non-vLLM engines), so vLLM and SGLang copies of a model never match.
+        llm_nodes_by_wm: Dict[tuple[str, str], List[str]] = defaultdict(list)
         for nid, node in node_specs.items():
-            if not node or node.engine != "vllm":
+            if not node or not is_llm_engine(node.engine):
                 continue
             assignment = node_worker.get(nid)
             wid_seq = (
                 tuple(assignment) if isinstance(assignment, (list, tuple)) else (assignment,)
             )
-            model = node.model or ""
+            model = llm_model_key(node) or ""
             for wid in wid_seq:
                 if wid is None:
                     continue
-                vllm_nodes_by_wm[(wid, model)].append(nid)
+                llm_nodes_by_wm[(wid, model)].append(nid)
 
         def worker_has_ready_same_model(model_name: str | None, worker_id: str) -> bool:
             if not model_name:
                 return False
-            for nid in vllm_nodes_by_wm.get((worker_id, model_name), ()):
+            for nid in llm_nodes_by_wm.get((worker_id, model_name), ()):
                 if ready.get(nid):
                     return True
             return False
@@ -499,14 +515,15 @@ class MultiProcessGraphProcessor:
                 preload_node = plan_nodes[cursor]
                 if min_epoch_incomplete is not None and task_map[preload_node].epoch != min_epoch_incomplete:
                     continue
-                desired_model = (node_specs[preload_node].model or "") if node_specs.get(preload_node) else ""
+                preload_spec = node_specs.get(preload_node)
+                desired_model = (llm_model_key(preload_spec) or "") if preload_spec else ""
                 curr_model = last_model_by_worker.get(wid)
                 if not desired_model or curr_model == desired_model:
                     continue
                 cfg_msg = TaskMessage(
                     node_id="__CONFIG__",
                     node=None,
-                    config={"epoch": task_map[preload_node].epoch, "model": desired_model},
+                    config=_engine_config(task_map[preload_node].epoch, preload_spec),
                 )
                 task_queues[wid].put(cfg_msg)
                 last_model_by_worker[wid] = desired_model
@@ -609,7 +626,7 @@ class MultiProcessGraphProcessor:
                 context_batch = [slice_context(idx) for idx in batch_indices]
 
                 # GPU worker 模型级串行：同一 GPU 上不同模型需等待在飞批次完成后再切换
-                desired_model = node.model or "" if node.engine == "vllm" else None
+                desired_model = (llm_model_key(node) or "") if is_llm_engine(node.engine) else None
                 if worker_ids_seq and all(worker_by_id.get(wid) and worker_by_id[wid].kind == "gpu" for wid in worker_ids_seq):
                     model_conflict = False
                     for wid in worker_ids_seq:
@@ -632,19 +649,19 @@ class MultiProcessGraphProcessor:
                             ready_nonempty.add(node_id)
                         continue
 
-                if node.engine == "vllm":
+                if is_llm_engine(node.engine):
                     for wid in worker_ids_seq:
                         curr_model = last_model_by_worker.get(wid)
                         if curr_model != desired_model:
                             cfg_msg = TaskMessage(
                                 node_id="__CONFIG__",
                                 node=None,
-                                config={"epoch": task.epoch, "model": desired_model},
+                                config=_engine_config(task.epoch, node),
                             )
                             task_queues[wid].put(cfg_msg)
                             last_model_by_worker[wid] = desired_model
 
-                if len(worker_ids_seq) > 1 and node.engine == "vllm":
+                if len(worker_ids_seq) > 1 and is_llm_engine(node.engine):
                     shards: Dict[str, List[int]] = {wid: [] for wid in worker_ids_seq}
                     # Load-aware sharding: prefer GPUs with fewer in-flight batches (capacity-adjusted).
                     load_est: Dict[str, float] = {}
@@ -812,7 +829,7 @@ class MultiProcessGraphProcessor:
                 remaining_counts[node_id] -= 1
                 completed_units += 1
                 node = node_specs.get(node_id)
-                if node and node.engine == "vllm":
+                if node and is_llm_engine(node.engine):
                     llm_done_units += 1
                 else:
                     db_done_units += 1

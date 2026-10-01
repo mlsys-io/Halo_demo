@@ -3,12 +3,12 @@ from __future__ import annotations
 import heapq
 from typing import Dict, Mapping, Sequence
 
-from ..models import GraphSpec, Node, Worker, build_dependency_list
+from ..models import GraphSpec, Node, Worker, build_dependency_list, is_llm_engine
 
 
 def default_worker_filter(node: Node, worker: Worker) -> bool:
-    """Basic compatibility: LLM nodes -> GPU, DB/HTTP/noop -> CPU."""
-    if node.engine == "vllm":
+    """Basic compatibility: LLM nodes (vLLM/SGLang) -> GPU, DB/HTTP/noop -> CPU."""
+    if is_llm_engine(node.engine):
         return worker.kind == "gpu"
     if node.engine in ("db", "http") or node.type == "db_query":
         return worker.kind == "cpu"

@@ -3,7 +3,7 @@ from __future__ import annotations
 import random
 from typing import Any, Dict, Mapping, Sequence, Tuple
 
-from ..models import ExecutionPlan, ExecutionTask, GraphSpec, Worker
+from ..models import ExecutionPlan, ExecutionTask, GraphSpec, Worker, is_llm_engine
 from .topo_utils import default_worker_filter, filtered_dependencies, topological_order
 
 
@@ -58,7 +58,7 @@ def build_random_topo_plan(
     for node_id in order:
         eligible = options[node_id]
         node = graph.nodes[node_id]
-        is_gpu = node.engine == "vllm"
+        is_gpu = is_llm_engine(node.engine)
         if is_gpu:
             pool = gpu_workers or tuple(sorted(eligible))
             pool_candidates = tuple(wid for wid in pool if wid in eligible)

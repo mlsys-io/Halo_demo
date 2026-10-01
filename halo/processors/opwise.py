@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, MutableMapping, Sequence
 
 from .. import metrics
-from ..models import ExecutionPlan, GraphSpec, Node
+from ..models import ExecutionPlan, GraphSpec, Node, is_llm_engine, llm_model_key
 from ..monitoring import ProgressMonitor, start_progress_monitor, start_system_monitor
 from ..worker import ResultMessage, TaskMessage, worker_process_loop
 from .base import BaseGraphProcessor, count_progress_nodes, is_progress_node
@@ -91,11 +91,11 @@ class OpwiseGraphProcessor(BaseGraphProcessor):
                 elif node.type == "processor":
                     outputs_list = self.processor_executor.execute_batch(node, contexts)
                     stats = self.processor_executor.consume_stats()
-                elif node.engine == "vllm":
-                    print(f"Executing VLLM node {node.id} with batch size {len(contexts)}")
-                    node_model = node.model or ""
+                elif is_llm_engine(node.engine):
+                    print(f"Executing {node.engine.upper()} node {node.id} with batch size {len(contexts)}")
+                    node_model = llm_model_key(node) or ""
                     if dp_pool is not None:
-                        self._configure_dp_model(dp_pool, node_model)
+                        self._configure_dp_model(dp_pool, node)
                         outputs_list, stats = self._execute_vllm_data_parallel(
                             node,
                             contexts,
@@ -104,7 +104,7 @@ class OpwiseGraphProcessor(BaseGraphProcessor):
                         )
                     else:
                         if node_model and self.current_model != node_model:
-                            # Switch model: clear cache and update tracker.
+                            # Switch model (or engine): clear cache and update tracker.
                             # The engine provider will lazy-load the new model on next use.
                             self.engine_provider.clear_cache()
                             self.current_model = node_model
@@ -130,7 +130,7 @@ class OpwiseGraphProcessor(BaseGraphProcessor):
 
                 self._record_worker_metrics(stats)
                 self._record_node_metrics(node, total_time=total_time, stats=stats, count=len(contexts))
-                if progress_monitor and is_progress_node(node) and node.engine != "vllm":
+                if progress_monitor and is_progress_node(node) and not is_llm_engine(node.engine):
                     progress_monitor.record(len(contexts))
 
                 for i, outputs in enumerate(outputs_list):
@@ -241,8 +241,8 @@ class OpwiseGraphProcessor(BaseGraphProcessor):
             except Exception:
                 pass
 
-    def _configure_dp_model(self, pool: _DPWorkerPool, model: str | None) -> None:
-        model_name = model or ""
+    def _configure_dp_model(self, pool: _DPWorkerPool, node: Node) -> None:
+        model_name = llm_model_key(node) or ""
         if model_name and pool.current_model == model_name:
             return
         for worker_id in pool.worker_ids:
@@ -250,7 +250,7 @@ class OpwiseGraphProcessor(BaseGraphProcessor):
                 TaskMessage(
                     node_id="__CONFIG__",
                     node=None,
-                    config={"epoch": 0, "model": model_name},
+                    config={"epoch": 0, "model": node.model or "", "engine": node.engine},
                 )
             )
         pool.current_model = model_name

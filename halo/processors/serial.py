@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, List, MutableMapping, Sequence, Set
 
-from ..models import ExecutionPlan, ExecutionTask, GraphSpec
+from ..models import ExecutionPlan, ExecutionTask, GraphSpec, is_llm_engine, llm_model_key
 from ..monitoring import ProgressMonitor, start_progress_monitor, start_system_monitor
 from .base import BaseGraphProcessor, count_progress_nodes, is_progress_node
 
@@ -90,10 +90,10 @@ class SerialGraphProcessor(BaseGraphProcessor):
             elif node.type == "processor":
                 outputs = self.processor_executor.execute(node, context)
                 stats = self.processor_executor.consume_stats()
-            elif node.engine == "vllm":
-                node_model = node.model or ""
+            elif is_llm_engine(node.engine):
+                node_model = llm_model_key(node) or ""
                 if node_model and self.current_model != node_model:
-                    # Switch model: clear cache and update tracker.
+                    # Switch model (or engine): clear cache and update tracker.
                     # The engine provider will lazy-load the new model on next use.
                     self.engine_provider.clear_cache()
                     self.current_model = node_model

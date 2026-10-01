@@ -7,7 +7,7 @@ import os
 import time
 from typing import Callable, Dict, Iterable, List, Mapping, Sequence, Set, Tuple
 
-from ..models import GraphSpec, Node, QueryPlanChoice, Worker
+from ..models import GraphSpec, Node, QueryPlanChoice, Worker, is_llm_engine, llm_model_key
 from .dp_config import DPSolverConfig
 from .dp_payload import RustPayload
 from .topo_utils import topological_order
@@ -103,6 +103,7 @@ class DPSolver:
         gpu_worker_ids: Tuple[str, ...] | None = None,
         cpu_worker_ids: Tuple[str, ...] | None = None,
         http_latency_s: Mapping[str, float] | None = None,
+        processor_latency_s: Mapping[str, float] | None = None,
         enable_batch_shape_pruning: bool | None = None,
         gpu_batch_slack: int | None = None,
         enable_lower_bound_pruning: bool | None = None,
@@ -124,6 +125,7 @@ class DPSolver:
             lambda node, last_node, parents: 1.0
         )
         self._http_latency_s = dict(http_latency_s or {})
+        self._processor_latency_s = dict(processor_latency_s or {})
         self._epoch_penalty_fn = epoch_penalty_fn or (lambda epoch: 1.0)
 
         # Build the effective config: start from caller-provided ``config``
@@ -213,6 +215,17 @@ class DPSolver:
             topo = list(self.node_ids)
         self._db_topo_order = tuple(nid for nid in topo if not self._is_gpu_node(nid))
 
+        # 不再喂给任何 LLM 节点的 CPU 节点（如 post-LLM 工具调用）：父节点完成后即可调度。
+        children: Dict[str, List[str]] = {nid: [] for nid in self.node_ids}
+        for nid in self.node_ids:
+            for parent in self.dependencies.get(nid, ()):
+                if parent in children:
+                    children[parent].append(nid)
+        feeds_llm: Dict[str, bool] = {}
+        for nid in reversed(topo):
+            feeds_llm[nid] = any(self._is_gpu_node(c) or feeds_llm.get(c, False) for c in children.get(nid, ()))
+        self._cpu_sink_ids = frozenset(nid for nid in self.node_ids if not self._is_gpu_node(nid) and not feeds_llm.get(nid, False))
+
         self.node_index = {node_id: idx for idx, node_id in enumerate(self.node_ids)}
         self.all_mask = (1 << len(self.node_ids)) - 1
         self.worker_index = {wid: idx for idx, wid in enumerate(worker_ids)}
@@ -243,8 +256,9 @@ class DPSolver:
         self._parents_mask = self._build_parents_mask(self.dependencies)
         self._gpu_parents_mask = self._build_parents_mask(self.dependencies, gpu_only=True)
 
+        # Model identity = llm_model_key (bare name for vLLM, engine-qualified otherwise).
         all_models = sorted(
-            {n.model for n in graph.nodes.values() if getattr(n, "model", None)}
+            {llm_model_key(n) for n in graph.nodes.values() if getattr(n, "model", None)}
         )
         self._model_to_int = {name: i for i, name in enumerate(all_models)}
         self._model_int_to_name = tuple(all_models)
@@ -483,7 +497,7 @@ class DPSolver:
                 {
                     "id": node_id,
                     "is_gpu": self._is_gpu_node(node_id),
-                    "model_id": int(self._model_to_id(getattr(node, "model", None), fallback=self._none_id)),
+                    "model_id": int(self._model_to_id(llm_model_key(node), fallback=self._none_id)),
                     "queries": queries_out,
                 }
             )
@@ -1075,7 +1089,7 @@ class DPSolver:
             if not queries:
                 new_state = WorkerState(
                     worker_idx=state.worker_idx,
-                    last_model_id=self._model_to_id(node.model, fallback=state.last_model_id),
+                    last_model_id=self._model_to_id(llm_model_key(node), fallback=state.last_model_id),
                     last_node_id=self._node_id_to_int[node.id],
                 )
                 yield base_cost, 0.0, new_state, {}, enter_window
@@ -1085,7 +1099,7 @@ class DPSolver:
             for query_cost, exit_window, plan_seq in options:
                 new_state = WorkerState(
                     worker_idx=state.worker_idx,
-                    last_model_id=self._model_to_id(node.model, fallback=state.last_model_id),
+                    last_model_id=self._model_to_id(llm_model_key(node), fallback=state.last_model_id),
                     last_node_id=self._node_id_to_int[node.id],
                 )
                 plan_map = {(node.id, q_name): choice for q_name, choice in plan_seq}
@@ -1219,7 +1233,7 @@ class DPSolver:
         cpu_nodes: Sequence[str],
         enter_window: Tuple[int, ...],
     ) -> Tuple[float, Dict[tuple[str, str], QueryPlanChoice]]:
-        """按既定 CPU 顺序累计 load cost（DB plan + HTTP sleep），window 仅在 epoch 内有效。"""
+        """按既定 CPU 顺序累计 load cost（DB plan + HTTP sleep + processor 实测延迟），window 仅在 epoch 内有效。"""
         if not cpu_nodes:
             return 0.0, {}
         window = enter_window
@@ -1229,6 +1243,9 @@ class DPSolver:
             node = self.graph.nodes[node_id]
             if node.engine == "http":
                 total_cost += self._http_sleep_cost(node)
+                continue
+            if node.type == "processor":
+                total_cost += self._processor_cost(node)
                 continue
             if not getattr(node, "db_queries", None):
                 continue
@@ -1248,6 +1265,13 @@ class DPSolver:
                 plan_map[(node.id, q_name)] = choice
             window = best_window
         return total_cost, plan_map
+
+    def _processor_cost(self, node: Node) -> float:
+        """Local-function 节点：使用 profiler 在规划前采样调用测得的平均延迟。"""
+        try:
+            return max(0.0, float(self._processor_latency_s.get(node.id, 0.0)))
+        except (TypeError, ValueError):
+            return 0.0
 
     def _http_sleep_cost(self, node: Node) -> float:
         if self._http_latency_s:
@@ -1541,7 +1565,7 @@ class DPSolver:
             batch_mask |= 1 << self.node_index[node_id]
 
         needed = self._cpu_needed_for_gpu(gpu_nodes)
-        needed = self._expand_cpu_parents(needed)
+        needed = self._expand_cpu_parents(needed | set(self._cpu_sink_ids))
         pending = {
             nid
             for nid in self._db_node_ids
@@ -1598,15 +1622,35 @@ class DPSolver:
                     stack.append(parent)
         return expanded
 
+    def _cpu_cost_estimate(self, node_id: str) -> float:
+        """估计单个 CPU 节点的代价（HTTP/processor 用 profiled 延迟，DB 用各 query 最便宜计划之和）。"""
+        node = self.graph.nodes[node_id]
+        if node.engine == "http":
+            return self._http_sleep_cost(node)
+        if node.type == "processor":
+            return self._processor_cost(node)
+        total = 0.0
+        for query in getattr(node, "db_queries", ()) or ():
+            choices = self.plan_choices.get((node_id, query.name)) or ()
+            if choices:
+                total += min(self._plan_base_cost(choice) for choice in choices)
+        return total
+
     def _cpu_assignments(self, cpu_nodes: Sequence[str]) -> List[tuple[str, str]]:
+        """CPU 节点映射到其可用 worker（按资源类别隔离，见 node_worker_options），
+        在可用 worker 之间按估计负载均衡。"""
         if not cpu_nodes:
             return []
-        workers = self.cpu_worker_ids or self.worker_ids
+        workers = tuple(self.cpu_worker_ids or self.worker_ids)
         if not workers:
             return []
+        load: Dict[str, float] = {}
         seq: List[tuple[str, str]] = []
-        for idx, node_id in enumerate(cpu_nodes):
-            wid = workers[idx % len(workers)]
+        for node_id in cpu_nodes:
+            allowed = self.node_worker_options.get(node_id, workers)
+            eligible = tuple(w for w in workers if w in allowed) or workers
+            wid = min(eligible, key=lambda w: (load.get(w, 0.0), eligible.index(w)))
+            load[wid] = load.get(wid, 0.0) + self._cpu_cost_estimate(node_id)
             seq.append((wid, node_id))
         return seq
 
@@ -1666,4 +1710,4 @@ class DPSolver:
 
     def _is_gpu_node(self, node_id: str) -> bool:
         node = self.graph.nodes[node_id]
-        return node.engine == "vllm"
+        return is_llm_engine(node.engine)

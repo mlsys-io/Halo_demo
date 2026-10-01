@@ -22,6 +22,8 @@ from .models import (
     QueryPlanChoice,
     Worker,
     build_dependency_list,
+    is_llm_engine,
+    llm_model_key,
 )
 from .query_planner import QueryPlanEvaluator, plan_evaluator_from_env
 from .profiler import GraphProfiler, GraphProfile
@@ -103,6 +105,7 @@ class GraphOptimizer:
         self._profiler = GraphProfiler(plan_evaluator=self._plan_evaluator)
         self._http_profile_latency: Dict[str, float] = {}
         self._http_profile_samples: Dict[str, int] = {}
+        self._processor_profile_latency: Dict[str, float] = {}
         self.last_query_window = max(1, last_query_window)
         env_db_weight = os.getenv("HALO_DP_CPU_LOAD_COST_WEIGHT")
         if env_db_weight is not None and env_db_weight.strip() != "":
@@ -228,6 +231,7 @@ class GraphOptimizer:
         plan_choices = profile.plan_choices
         self._http_profile_latency = dict(profile.http_latencies_s)
         self._http_profile_samples = dict(profile.http_samples)
+        self._processor_profile_latency = dict(profile.processor_latencies_s)
 
         # 规划阶段的 cost 需要一个“输入 query 数量”标尺：
         # - runner remember: --sample-count 是本次 run 处理的 query 数量（建议用它）
@@ -363,6 +367,7 @@ class GraphOptimizer:
             gpu_worker_ids=gpu_worker_ids,
             cpu_worker_ids=cpu_worker_ids,
             http_latency_s=self._http_profile_latency,
+            processor_latency_s=self._processor_profile_latency,
             debug_log=False,
         )
         _, schedule, selected_plans = solver.solve(initial_worker_states)
@@ -650,7 +655,7 @@ class GraphOptimizer:
         for node_id in order:
             node = graph.nodes[node_id]
             deps = tuple(dependencies.get(node_id, ()))
-            if node.engine == "vllm":
+            if is_llm_engine(node.engine):
                 if not gpu_worker_ids:
                     raise RuntimeError(f"No GPU workers available for LLM node '{node_id}'.")
                 allowed = tuple(node_worker_options.get(node_id, gpu_worker_ids))
@@ -693,11 +698,11 @@ class GraphOptimizer:
     def _exec_cost(self, node: Node, _worker: Worker) -> float:
         """执行成本（不含模型切换）。
 
-        - vLLM: 仅依赖 model size + 输入 query 数量（通常等于 runner 的 --sample-count）
+        - LLM (vLLM/SGLang): 仅依赖 model size + 输入 query 数量（通常等于 runner 的 --sample-count）
         - DB: 仅依赖输入 query 数量（estimate cost 由 query plan choice 单独提供）
         - HTTP: 使用 profiler 结果（或 fallback 到配置的 sleep/latency）
         """
-        if node.engine == "vllm":
+        if is_llm_engine(node.engine):
             size_b = self._model_size_b(node)
             input_factor = self._llm_input_sec * max(1, int(getattr(self, "_input_query_count", 1)))
             return self._llm_base_sec_per_b * size_b + input_factor
@@ -761,6 +766,8 @@ class GraphOptimizer:
             plan.metadata.setdefault("http_profile_latency_s", dict(self._http_profile_latency))
         if self._http_profile_samples:
             plan.metadata.setdefault("http_profile_samples", dict(self._http_profile_samples))
+        if self._processor_profile_latency:
+            plan.metadata.setdefault("processor_profile_latency_s", dict(self._processor_profile_latency))
 
     def _select_query_plan_defaults(
         self,
@@ -803,7 +810,7 @@ class GraphOptimizer:
         for idx in reversed(last_epoch_indices):
             candidate = plan.tasks[idx]
             node = graph.nodes.get(candidate.node_id)
-            if node is not None and node.engine == "vllm":
+            if node is not None and is_llm_engine(node.engine):
                 target_idx = idx
                 target_task = candidate
                 break
@@ -889,11 +896,11 @@ class GraphOptimizer:
             return 1.0
         return max(0.5, 1.0 - 0.01 * overlap)
 
-    # 模型初始化成本（仅 vLLM）
+    # 模型初始化成本（仅 LLM 节点：vLLM / SGLang）；last_model 为 llm_model_key
     def _model_init_cost(self, node: Node, last_model: str | None) -> float:
-        if node.engine != "vllm":
+        if not is_llm_engine(node.engine):
             return 0.0
-        node_model = node.model or ""
+        node_model = llm_model_key(node) or ""
         size_b = self._model_size_b(node)
         if last_model is None:
             return (self._model_init_sec_per_b * size_b) / 2.0
@@ -957,7 +964,7 @@ class GraphOptimizer:
         return options
 
     def _worker_can_run(self, node: Node, worker: Worker) -> bool:
-        if node.engine == "vllm":
+        if is_llm_engine(node.engine):
             return worker.kind == "gpu"
         if node.engine in ("db", "http") or node.type == "db_query":
             return worker.kind == "cpu"

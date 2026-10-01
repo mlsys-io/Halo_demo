@@ -16,6 +16,10 @@ dependencies = [
 postgres = [
     "psycopg[binary]>=3.1.0",
 ]
+# `engine: sglang` nodes run on SGLang's offline engine instead of vLLM (see README).
+sglang = [
+    "sglang>=0.5.0",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]

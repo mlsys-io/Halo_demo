@@ -14,6 +14,8 @@ from ..models import (
     QueryPlanChoice,
     Worker,
     build_dependency_list,
+    is_llm_engine,
+    llm_model_key,
 )
 from .topo_utils import default_worker_filter, filtered_dependencies, topological_order
 
@@ -206,8 +208,8 @@ def build_continuous_milp_plan(
             else (nid for nid, node in graph.nodes.items() if node.type != "input")
         )
     )
-    llm_node_ids = tuple(nid for nid in node_ids_all if graph.nodes[nid].engine == "vllm")
-    db_node_ids_all = tuple(nid for nid in node_ids_all if graph.nodes[nid].engine != "vllm")
+    llm_node_ids = tuple(nid for nid in node_ids_all if is_llm_engine(graph.nodes[nid].engine))
+    db_node_ids_all = tuple(nid for nid in node_ids_all if not is_llm_engine(graph.nodes[nid].engine))
     # Align with DP: optimize only GPU/LLM nodes when available, then auto-fill DB nodes per epoch.
     node_ids = llm_node_ids if llm_node_ids else node_ids_all
     if len(node_ids) > max_nodes:
@@ -242,7 +244,7 @@ def build_continuous_milp_plan(
     model_init_cost_fn = model_init_cost_fn or (lambda _node, _last_model: 0.0)
     llm_cache_bonus_fn = llm_cache_bonus_fn or (lambda _node, _last_node, _parents: 1.0)
 
-    db_nodes = tuple(nid for nid in node_ids if graph.nodes[nid].engine != "vllm")
+    db_nodes = tuple(nid for nid in node_ids if not is_llm_engine(graph.nodes[nid].engine))
 
     fallback_choice = QueryPlanChoice(
         plan_id="default",
@@ -597,7 +599,7 @@ def build_continuous_milp_plan(
     # Define completion times using predecessor-dependent durations
     for node_id in node_ids:
         node = graph.nodes[node_id]
-        if node.engine == "vllm":
+        if is_llm_engine(node.engine):
             dur_terms = []
             db_cost = float(llm_cpu_costs.get(node_id, 0.0))
             for wid in options[node_id]:
@@ -616,12 +618,12 @@ def build_continuous_milp_plan(
                 for prev in eligible_nodes_by_worker[wid]:
                     if prev == node_id:
                         continue
-                    if graph.nodes[prev].engine != "vllm":
+                    if not is_llm_engine(graph.nodes[prev].engine):
                         continue
                     pvar = pred.get((prev, node_id, wid))
                     if pvar is None:
                         continue
-                    last_model = graph.nodes[prev].model
+                    last_model = llm_model_key(graph.nodes[prev])
                     bonus = float(llm_cache_bonus_fn(node, prev, deps.get(node_id, ())))
                     cost = (
                         float(exec_cost_fn(node, workers[wid])) * bonus
@@ -659,7 +661,7 @@ def build_continuous_milp_plan(
     big_m = 0.0
     for node_id in node_ids:
         node = graph.nodes[node_id]
-        if node.engine == "vllm":
+        if is_llm_engine(node.engine):
             # Upper bound on per-node runtime: no cache bonus + worst-case model switch cost.
             wid0 = options[node_id][0]
             base = float(exec_cost_fn(node, workers[wid0]))

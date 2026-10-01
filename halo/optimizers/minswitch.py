@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Mapping, Sequence, Tuple
 
-from ..models import ExecutionPlan, ExecutionTask, GraphSpec, Worker
+from ..models import ExecutionPlan, ExecutionTask, GraphSpec, Worker, is_llm_engine, llm_model_key
 from .topo_utils import default_worker_filter, filtered_dependencies, topological_order
 
 
@@ -57,8 +57,8 @@ def build_min_switch_plan(
         eligible = options[node_id]
         chosen: str | None = None
 
-        if node.engine == "vllm":
-            same = [wid for wid in eligible if last_model.get(wid) == node.model]
+        if is_llm_engine(node.engine):
+            same = [wid for wid in eligible if last_model.get(wid) == llm_model_key(node)]
             if same:
                 chosen = min(same, key=lambda wid: (load.get(wid, 0), wid))
             else:
@@ -77,8 +77,8 @@ def build_min_switch_plan(
             chosen = eligible[0]
 
         load[chosen] = load.get(chosen, 0) + 1
-        if node.engine == "vllm":
-            last_model[chosen] = node.model or last_model.get(chosen)
+        if is_llm_engine(node.engine):
+            last_model[chosen] = llm_model_key(node) or last_model.get(chosen)
         epoch = idx // total_workers
         tasks.append(
             ExecutionTask(

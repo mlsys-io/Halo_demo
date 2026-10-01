@@ -9,8 +9,8 @@ import threading
 import time
 
 from .db import DatabaseExecutor, DefaultDatabaseExecutor
-from .engines import make_vllm_provider
-from .models import Node
+from .engines import make_llm_provider
+from .models import Node, is_llm_engine
 from .executor import DBNodeExecutor, HTTPNodeExecutor, ProcessorNodeExecutor, VLLMNodeExecutor
 
 LOGGER = logging.getLogger(__name__)
@@ -62,19 +62,20 @@ def worker_process_loop(
 ) -> None:
     """Worker 进程主循环。
 
-    每个 GPU worker 进程拥有自己的 EngineProvider 和 vLLM 引擎 cache。
+    每个 GPU worker 进程拥有自己的 EngineProvider 和 LLM 引擎（vLLM / SGLang）cache。
     """
     engine_kwargs = dict(engine_kwargs or {})
     executor_kwargs = dict(executor_kwargs or {})
 
     configure_device_env(device)
 
-    engine_provider = make_vllm_provider(**engine_kwargs)
+    engine_provider = make_llm_provider(**engine_kwargs)
     node_executor = VLLMNodeExecutor(
         engine_provider=engine_provider,
         **executor_kwargs,
     )
     current_model: str | None = None
+    current_engine: str | None = None
     current_epoch: int | None = None
     pending_init_stats: Dict[str, Any] | None = None
 
@@ -102,16 +103,19 @@ def worker_process_loop(
         if task.config is not None:
             epoch = task.config.get("epoch")
             model = task.config.get("model")
-            if model != current_model:
+            engine = task.config.get("engine") or "vllm"
+            if model != current_model or engine != current_engine:
+                # Model/engine switch: evict (and shut down) the cached engine first.
                 try:
                     node_executor.engine_provider.clear_cache()
                 except AttributeError:
                     pass
                 current_model = model
-                # Warm up vLLM to overlap model init.
+                current_engine = engine
+                # Warm up the engine to overlap model init.
                 if current_model:
                     try:
-                        node_executor.warmup_model(current_model)
+                        node_executor.warmup_model(current_model, engine=current_engine)
                         # Preserve model init stats to return on first real task.
                         pending_init_stats = node_executor.consume_stats()
                     except Exception:
@@ -164,12 +168,17 @@ def worker_process_loop(
         executed = False
         start_time = time.perf_counter()
         try:
-            if task.node.engine == "vllm" and current_model is not None:
+            if is_llm_engine(task.node.engine) and current_model is not None:
                 node_model = task.node.model or ""
                 if node_model != current_model:
                     raise RuntimeError(
                         f"Worker {worker_id} configured for model {current_model} "
                         f"but received node model {node_model}"
+                    )
+                if task.node.engine != current_engine:
+                    raise RuntimeError(
+                        f"Worker {worker_id} configured for engine {current_engine} "
+                        f"but received {task.node.engine} node {task.node.id}"
                     )
             if len(contexts) == 1:
                 executed = True
@@ -200,6 +209,9 @@ def worker_process_loop(
                 stats=stats_payload,
             )
         )
+
+    # Worker close: evict cached engines so SGLang's subprocesses release GPU memory.
+    engine_provider.clear_cache()
 
 
 def cpu_worker_loop(

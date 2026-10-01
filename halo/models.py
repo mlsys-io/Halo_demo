@@ -4,6 +4,30 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Sequence
 
 
+# LLM serving engines hosted by GPU workers. A node whose ``engine`` is one of
+# these is an LLM node: costed/planned/placed on a GPU worker, batched, and run
+# by the matching engine wrapper in ``halo.engines``.
+LLM_ENGINES: tuple[str, ...] = ("vllm", "sglang")
+
+
+def is_llm_engine(engine: str | None) -> bool:
+    """Whether ``engine`` names a GPU LLM engine (vLLM or SGLang)."""
+    return engine in LLM_ENGINES
+
+
+def llm_model_key(node: "Node") -> str | None:
+    """Identity of the model a GPU worker must have loaded to run ``node``.
+
+    Planners and workers compare it to decide whether a model switch (engine
+    teardown + reload) is needed. vLLM nodes keep the bare model name; other
+    engines are qualified (``"sglang:<model>"``) so the same checkpoint served
+    by vLLM and by SGLang still counts as a switch.
+    """
+    if not node.model or node.engine == "vllm" or not is_llm_engine(node.engine):
+        return node.model
+    return f"{node.engine}:{node.model}"
+
+
 @dataclass(frozen=True, slots=True)
 class DBQuery:
     """Represents a templated SQL query defined in the YAML graph."""

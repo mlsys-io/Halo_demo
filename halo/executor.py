@@ -8,14 +8,15 @@ import threading
 from datetime import datetime
 import re
 import time
-from typing import Any, Dict, List, Mapping, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Sequence
 from decimal import Decimal
 from collections import OrderedDict
+from functools import lru_cache
 
 from . import metrics
 from .db import DatabaseExecutor, MissingQueryInputs, PostgresDatabaseExecutor, PostgresPlanExplainer, resolve_query_parameters
 from .engines import EngineProvider
-from .models import DBQuery, Node
+from .models import DBQuery, Node, is_llm_engine
 from .utils import MISSING, lookup_path, maybe_parse_json, render_template
 from .node_processors import run_processor_node
 
@@ -57,14 +58,19 @@ class ExecutionStats:
         }
 
 
+_COALESCE_CACHE_SIZE = 1024
+
+
 @dataclass(slots=True)
 class _BaseExecutor:
     _stats: ExecutionStats = field(init=False, repr=False)
     _stats_lock: threading.Lock = field(init=False, repr=False)
+    _coalesce_cache: "OrderedDict[str, Dict[str, Any]]" = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._stats = ExecutionStats()
         self._stats_lock = threading.Lock()
+        self._coalesce_cache = OrderedDict()
 
     def _begin_execution(self) -> None:
         with self._stats_lock:
@@ -104,6 +110,107 @@ class _BaseExecutor:
         with self._stats_lock:
             self._stats.model_init_time += elapsed
             self._stats.model_init_calls += count
+
+    def _execute_coalesced(
+        self,
+        node: Node,
+        contexts: Sequence[Mapping[str, Any]],
+        signature_fn: Callable[[Node, Mapping[str, Any]], str],
+        run_once: Callable[[Node, Mapping[str, Any]], Dict[str, Any]],
+        pool: ThreadPoolExecutor | None = None,
+    ) -> List[Dict[str, Any]]:
+        """Run ``run_once`` once per distinct signature and fan the result out.
+
+        Only used for operators declared ``coalesce: true`` (deterministic and
+        side-effect free); every context receives its own shallow copy. Results
+        are also kept in a bounded cache so identical calls in later micro-batches
+        reuse them.
+        """
+        signatures = [signature_fn(node, ctx) for ctx in contexts]
+        results: Dict[str, Dict[str, Any]] = {}
+        owner: Dict[str, int] = {}
+        with self._stats_lock:
+            for idx, sig in enumerate(signatures):
+                if sig in results or sig in owner:
+                    continue
+                cached = self._coalesce_cache.get(sig)
+                if cached is not None:
+                    self._coalesce_cache.move_to_end(sig)
+                    results[sig] = cached
+                else:
+                    owner[sig] = idx
+        if pool is not None and len(owner) > 1:
+            future_map = {pool.submit(run_once, node, contexts[idx]): sig for sig, idx in owner.items()}
+            for future in as_completed(future_map):
+                results[future_map[future]] = future.result()
+        else:
+            for sig, idx in owner.items():
+                results[sig] = run_once(node, contexts[idx])
+        with self._stats_lock:
+            for sig in owner:
+                self._coalesce_cache[sig] = results[sig]
+                self._coalesce_cache.move_to_end(sig)
+            while len(self._coalesce_cache) > _COALESCE_CACHE_SIZE:
+                self._coalesce_cache.popitem(last=False)
+        return [dict(results[sig]) for sig in signatures]
+
+
+_SQL_WRITE_RE = re.compile(
+    r"\b(insert|update|delete|merge|upsert|create|drop|alter|truncate|grant|revoke|copy|call|do|lock|vacuum|refresh)\b",
+    re.IGNORECASE,
+)
+_SQL_VOLATILE_RE = re.compile(
+    r"\b(random|now|clock_timestamp|statement_timestamp|transaction_timestamp|timeofday|current_timestamp|"
+    r"localtimestamp|current_time|localtime|nextval|setval|currval|lastval|gen_random_uuid|uuid_generate_v[14]|"
+    r"txid_current|pg_sleep)\b",
+    re.IGNORECASE,
+)
+
+
+@lru_cache(maxsize=1024)
+def sql_coalescible(sql: str) -> bool:
+    """Only read-only statements without volatile functions may share one execution."""
+    text = re.sub(r"--[^\n]*|/\*.*?\*/", " ", sql, flags=re.DOTALL)
+    text = re.sub(r"'(?:[^']|'')*'", "''", text)
+    words = text.split(None, 1)
+    if not words or words[0].lower() not in ("select", "with", "values", "table"):
+        return False
+    return not (_SQL_WRITE_RE.search(text) or _SQL_VOLATILE_RE.search(text))
+
+
+def coalescing_enabled(node: Node) -> bool:
+    """A tool operator is coalesced only when the template declares it deterministic."""
+    raw = node.raw if isinstance(node.raw, Mapping) else {}
+    return bool(raw.get("coalesce", False))
+
+
+def _input_signature(node: Node, context: Mapping[str, Any], extra: Mapping[str, Any] | None = None) -> str:
+    """Signature of a tool call: operator id, its bound inputs, and request fields."""
+    payload: Dict[str, Any] = {"node": node.id}
+    for name in node.inputs:
+        value = lookup_path(context, name)
+        payload[name] = None if value is MISSING else value
+    if extra:
+        payload["request"] = dict(extra)
+    return json.dumps(payload, sort_keys=True, default=str, ensure_ascii=False)
+
+
+# Request-defining fields of an HTTP operator (rendered against the query context).
+_HTTP_REQUEST_FIELDS = (
+    "url", "method", "params", "query", "body", "json", "headers",
+    "sleep_s", "sleep_ms", "latency_s", "latency_ms", "timeout_s", "timeout_ms",
+)
+
+
+def _http_signature(node: Node, context: Mapping[str, Any]) -> str:
+    raw = node.raw if isinstance(node.raw, Mapping) else {}
+    request: Dict[str, Any] = {}
+    for key in _HTTP_REQUEST_FIELDS:
+        if key not in raw:
+            continue
+        value = raw[key]
+        request[key] = render_template(value, context) if isinstance(value, str) else value
+    return _input_signature(node, context, request)
 
 
 @dataclass(slots=True)
@@ -223,6 +330,11 @@ class DBNodeExecutor(_BaseExecutor):
         batch_result_cache: Dict[tuple[str, str], Mapping[str, Any]] = {}
 
         for query in queries:
+            if not sql_coalescible(query.sql):
+                # Writes / volatile functions run once per query (no sharing, no cache).
+                for idx, results in enumerate(self._run_db_queries_no_cache(node, contexts, [query])):
+                    results_per_context[idx].extend(results)
+                continue
             per_ctx_params: List[tuple[Dict[str, Any], bool]] = []
             signature_owner: Dict[str, int] = {}
 
@@ -570,6 +682,10 @@ class HTTPNodeExecutor(_BaseExecutor):
             return []
         if node.engine != "http":
             raise RuntimeError(f"HTTPNodeExecutor only supports engine='http' (got {node.engine})")
+        if coalescing_enabled(node):
+            return self._execute_coalesced(
+                node, contexts, _http_signature, self._execute_http_once, pool=self._thread_pool
+            )
         if self._thread_pool is None or len(contexts) == 1:
             return [self._execute_http_once(node, ctx) for ctx in contexts]
 
@@ -657,19 +773,21 @@ class ProcessorNodeExecutor(_BaseExecutor):
             raise RuntimeError(
                 f"ProcessorNodeExecutor only supports type='processor' (got type={node.type})"
             )
+        if coalescing_enabled(node):
+            return self._execute_coalesced(node, contexts, _input_signature, run_processor_node)
         return [run_processor_node(node, ctx) for ctx in contexts]
 
 
 @dataclass(slots=True)
 class VLLMNodeExecutor(_BaseExecutor):
-    """Only handles vLLM nodes."""
+    """Handles LLM nodes (vLLM or SGLang engines, resolved via ``engine_provider``)."""
 
     engine_provider: EngineProvider
 
     def execute(self, node: Node, context: Mapping[str, Any]) -> Dict[str, Any]:
         self._begin_execution()
-        if node.engine != "vllm":
-            raise RuntimeError(f"Unsupported node for VLLM executor: engine={node.engine}")
+        if not is_llm_engine(node.engine):
+            raise RuntimeError(f"Unsupported node for LLM executor: engine={node.engine}")
         return self._execute_vllm_batch(node, [context])[0]
 
     def execute_batch(
@@ -678,16 +796,16 @@ class VLLMNodeExecutor(_BaseExecutor):
         contexts: Sequence[Mapping[str, Any]],
     ) -> List[Dict[str, Any]]:
         self._begin_execution()
-        if node.engine != "vllm":
-            raise RuntimeError(f"Unsupported node for VLLM executor: engine={node.engine}")
+        if not is_llm_engine(node.engine):
+            raise RuntimeError(f"Unsupported node for LLM executor: engine={node.engine}")
         return self._execute_vllm_batch(node, contexts)
 
-    def warmup_model(self, model: str) -> None:
-        """Preload a model to overlap initialization before real tasks."""
+    def warmup_model(self, model: str, engine: str = "vllm") -> None:
+        """Preload a model on ``engine`` to overlap initialization before real tasks."""
         dummy = Node(
             id="__warmup__",
             type="inference",
-            engine="vllm",
+            engine=engine,
             model=model,
             inputs=(),
             outputs=(),

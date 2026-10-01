@@ -31,6 +31,7 @@ class GraphTemplateParser:
         nodes = self._parse_nodes(graph_data.get("nodes", []))
         edges = self._parse_edges(graph_data.get("edges", []))
         nodes, edges = self._expand_db_queries(nodes, edges)
+        nodes, edges = self._expand_tool_calls(nodes, edges)
         return GraphSpec(name=name, description=description, nodes=nodes, edges=edges)
 
     def _parse_nodes(self, nodes: Iterable[Dict[str, Any]]) -> Dict[str, Node]:
@@ -181,5 +182,92 @@ class GraphTemplateParser:
                 )
                 new_nodes[db_node_id] = db_node
                 new_edges.append(Edge(source=node_id, target=db_node_id, mapping={}))
+
+        return new_nodes, new_edges
+
+    def _expand_tool_calls(
+        self,
+        nodes: Dict[str, Node],
+        edges: List[Edge],
+    ) -> Tuple[Dict[str, Node], List[Edge]]:
+        """Split API / local-function calls embedded in a node into standalone tool nodes.
+
+        A node may declare ``tool_calls``: entries with a ``name`` and ``kind``
+        (``http`` or ``processor``) plus that tool's own fields (e.g. ``sleep_s`` /
+        ``url`` for HTTP, ``processor`` / ``config`` for local functions). Like
+        ``db_queries``, pre-LLM calls (default) feed the node, ``post_llm: true``
+        calls consume its outputs, and the node's inputs gain the call outputs.
+        """
+        new_nodes: Dict[str, Node] = {}
+        new_edges: List[Edge] = list(edges)
+
+        incoming: Dict[str, List[Edge]] = {}
+        for edge in edges:
+            incoming.setdefault(edge.target, []).append(edge)
+
+        def unique_node_id(base: str) -> str:
+            candidate = base
+            suffix = 1
+            while candidate in nodes or candidate in new_nodes:
+                candidate = f"{base}_{suffix}"
+                suffix += 1
+            return candidate
+
+        for node_id, node in nodes.items():
+            calls = node.raw.get("tool_calls") or []
+            if not calls:
+                new_nodes[node_id] = node
+                continue
+            for call in calls:
+                if not isinstance(call, dict) or not call.get("name"):
+                    raise GraphValidationError(f"Node '{node_id}': every tool call needs a 'name'.")
+                if call.get("kind", "http") not in ("http", "processor"):
+                    raise GraphValidationError(
+                        f"Node '{node_id}': tool call kind must be 'http' or 'processor' (got {call.get('kind')!r})."
+                    )
+
+            pre_calls = [c for c in calls if not c.get("post_llm", False)]
+            post_calls = [c for c in calls if c.get("post_llm", False)]
+            raw = {k: v for k, v in node.raw.items() if k != "tool_calls"}
+            new_nodes[node_id] = Node(
+                id=node_id,
+                type=node.type,
+                engine=node.engine,
+                model=node.model,
+                system_prompt=node.system_prompt,
+                inputs=tuple(dict.fromkeys(list(node.inputs) + [c["name"] for c in pre_calls])),
+                outputs=node.outputs,
+                db_queries=node.db_queries,
+                raw=raw,
+            )
+
+            def tool_node(call: Dict[str, Any], stage: str, inputs: Tuple[str, ...]) -> Node:
+                kind = call.get("kind", "http")
+                fields = {k: v for k, v in call.items() if k not in ("name", "kind", "post_llm")}
+                return Node(
+                    id=unique_node_id(f"{node_id}__{stage}__{call['name']}"),
+                    type=kind,
+                    engine="http" if kind == "http" else None,
+                    model=None,
+                    system_prompt=None,
+                    inputs=inputs,
+                    outputs=(call["name"],),
+                    db_queries=tuple(),
+                    raw={**fields, "parent": node_id, "source": f"{stage}_tool"},
+                )
+
+            # Pre-LLM calls become standalone tool nodes feeding the LLM node.
+            for call in pre_calls:
+                tnode = tool_node(call, "pre", tuple(node.inputs))
+                new_nodes[tnode.id] = tnode
+                for edge in incoming.get(node_id, []):
+                    new_edges.append(Edge(source=edge.source, target=tnode.id, mapping=dict(edge.mapping)))
+                new_edges.append(Edge(source=tnode.id, target=node_id, mapping={}))
+
+            # Post-LLM calls depend on the LLM node.
+            for call in post_calls:
+                tnode = tool_node(call, "post", tuple(node.inputs) + tuple(node.outputs))
+                new_nodes[tnode.id] = tnode
+                new_edges.append(Edge(source=node_id, target=tnode.id, mapping={}))
 
         return new_nodes, new_edges

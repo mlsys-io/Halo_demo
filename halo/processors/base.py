@@ -10,12 +10,12 @@ from ..db import (
     DefaultDatabaseExecutor,
     make_peer_postgres_executor,
 )
-from ..models import ExecutionPlan, GraphSpec, Node
+from ..models import LLM_ENGINES, ExecutionPlan, GraphSpec, Node
 from ..executor import DBNodeExecutor, HTTPNodeExecutor, ProcessorNodeExecutor, VLLMNodeExecutor
-from ..engines import make_vllm_provider
+from ..engines import make_llm_provider
 
 
-_PROGRESS_ENGINES = {"vllm", "db", "http"}
+_PROGRESS_ENGINES = {*LLM_ENGINES, "db", "http"}
 
 
 def is_progress_node(node: Node | None) -> bool:
@@ -89,12 +89,13 @@ class BaseGraphProcessor(abc.ABC):
         if tp_enabled and (tp_size is None or tp_size <= 0):
             tp_size = self._detect_gpu_count()
 
-        vllm_kwargs = dict(self.engine_kwargs)
-        vllm_kwargs["allow_tensor_parallel"] = tp_enabled
+        llm_kwargs = dict(self.engine_kwargs)
+        llm_kwargs["allow_tensor_parallel"] = tp_enabled
         if tp_enabled and tp_size is not None:
-            vllm_kwargs.setdefault("tensor_parallel_size", tp_size)
+            llm_kwargs.setdefault("tensor_parallel_size", tp_size)
 
-        self.engine_provider = make_vllm_provider(**vllm_kwargs)
+        # Builds a VLLMEngine or SGLangEngine per node.engine.
+        self.engine_provider = make_llm_provider(**llm_kwargs)
         self.vllm_executor = VLLMNodeExecutor(engine_provider=self.engine_provider)
         self.processor_executor = ProcessorNodeExecutor()
         self.current_model: str | None = None

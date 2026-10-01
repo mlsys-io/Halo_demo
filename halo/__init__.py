@@ -10,6 +10,7 @@ from .executor import DBNodeExecutor, HTTPNodeExecutor, VLLMNodeExecutor
 from .optimizer import GraphOptimizer
 from .parser import GraphTemplateParser
 from .processors import MultiProcessGraphProcessor, OpwiseGraphProcessor, SerialGraphProcessor
+from .streaming import StreamingSession
 
 __all__ = [
     "DatabaseExecutor",
@@ -24,4 +25,5 @@ __all__ = [
     "MultiProcessGraphProcessor",
     "OpwiseGraphProcessor",
     "SerialGraphProcessor",
+    "StreamingSession",
 ]

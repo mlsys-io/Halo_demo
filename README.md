@@ -41,6 +41,13 @@ Pure-LLM workflows need nothing more. Workflows that attach SQL `db_queries`
 to a node additionally require a Postgres backend — install that extra with
 `uv sync --extra postgres`.
 
+Nodes with `engine: sglang` run on [SGLang](https://github.com/sgl-project/sglang)
+instead of vLLM (optional extra: `uv sync --extra sglang`). Current SGLang and
+vLLM releases pin different PyTorch builds, so the full SGLang runtime
+(`sglang[all]`) usually needs its own environment; Halo imports each engine
+lazily, so there `uv pip install pyyaml pulp && uv pip install --no-deps -e .`
+is enough to run SGLang-only templates.
+
 > The DP scheduler has an optional Rust core in the full research build. This
 > demo ships the pure-Python implementation only; the DP solver automatically
 > falls back to Python, producing identical plans.
@@ -75,8 +82,27 @@ graph:
     - {from: user_input, to: reason,  mapping: {user_query: "{{ user_query }}"}}
     - {from: reason,     to: answer,  mapping: {user_query: "{{ user_query }}", reasoning: "{{ reasoning }}"}}
 ```
+A node may use `engine: sglang` instead, with the same fields, and a template
+may mix both engines: SGLang nodes are costed, planned, and batched like vLLM
+nodes, and each GPU worker hosts whichever engine its current node needs.
+`engine_kwargs` passed to a processor use vLLM names (e.g.
+`gpu_memory_utilization`, `sampling_params={"max_tokens": ...}`); Halo maps
+them to SGLang's equivalents and drops options SGLang does not accept.
+SGLang starts its scheduler with `spawn`, so run such workflows from a script
+guarded by `if __name__ == "__main__":`.
+
 A node may also carry `db_queries` (SQL with `:named` parameters); Halo splits
 those into standalone CPU nodes and schedules them alongside the LLM nodes.
+Identical SQL statements across the queries of a batch execute once and share
+their result. HTTP (`engine: http`) and local-function (`type: processor`)
+nodes are coalesced the same way when the template declares them deterministic
+with `coalesce: true`; calls are then keyed by the node's bound inputs and
+rendered request fields. When a template mixes SQL and HTTP operators, the
+planner places them on separate CPU workers so a slow API call cannot block
+database work. API and local-function calls can also be embedded in an LLM
+node as `tool_calls` (each with a `name`, `kind: http|processor`, and the tool's
+fields; `post_llm: true` runs it after the LLM); the parser extracts them into
+standalone tool nodes, just like `db_queries`.
 
 2. Parse the graph, build an optimized execution plan, and run a batch:
 ```python
@@ -100,9 +126,17 @@ processor.close()
 for q, ctx in zip(queries, results):
     print(q, "->", ctx.get("final_answer"))
 ```
+For online serving, `StreamingSession(optimizer, processor)` buffers submitted
+queries (`submit(graph, context)`) and `flush()` runs them in single-template
+mini-batches, planning once per template and re-optimizing when the template
+changes. `MultiProcessGraphProcessor(max_batch_size="auto")` splits each
+operator's instances into two micro-batches.
+
 `build_plan` (planning) runs on CPU; `run_batch` (execution) needs the GPUs and
-model weights for the `vllm` nodes. With `plan_mode="profiled"` and `db_queries`
+model weights for the `vllm`/`sglang` nodes. With `plan_mode="profiled"` and `db_queries`
 present, planning also profiles SQL via `EXPLAIN`, which requires Postgres.
+Before planning, HTTP and local-function nodes are invoked on the sample
+contexts and timed; the mean latency is their cost in the plan.
 
 ## Citation
 If you find this project useful, please consider citing our work:
