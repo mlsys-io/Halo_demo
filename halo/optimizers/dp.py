@@ -8,6 +8,7 @@ import time
 from typing import Callable, Dict, Iterable, List, Mapping, Sequence, Set, Tuple
 
 from ..models import GraphSpec, Node, QueryPlanChoice, Worker, is_llm_engine, llm_model_key
+from ..utils import http_cost
 from .dp_config import DPSolverConfig
 from .dp_payload import RustPayload
 from .topo_utils import topological_order
@@ -225,6 +226,10 @@ class DPSolver:
         for nid in reversed(topo):
             feeds_llm[nid] = any(self._is_gpu_node(c) or feeds_llm.get(c, False) for c in children.get(nid, ()))
         self._cpu_sink_ids = frozenset(nid for nid in self.node_ids if not self._is_gpu_node(nid) and not feeds_llm.get(nid, False))
+        # Sinks and their CPU ancestors are scheduled as soon as possible; the closure is constant.
+        self._cpu_sink_closure = frozenset(self._expand_cpu_parents(set(self._cpu_sink_ids)))
+        self._cpu_cost_cache: Dict[str, float] = {}
+        self._cpu_eligible_cache: Dict[str, Tuple[str, ...]] = {}
 
         self.node_index = {node_id: idx for idx, node_id in enumerate(self.node_ids)}
         self.all_mask = (1 << len(self.node_ids)) - 1
@@ -916,23 +921,7 @@ class DPSolver:
             if min_worker_cost == float("inf"):
                 min_worker_cost = 0.0
             # 最便宜的 plan cost（忽略 cache multiplier）
-            min_plan_cost = 0.0
-            for q in getattr(node, "db_queries", []) or []:
-                choices = self.plan_choices.get((node.id, q.name), ())
-                if not choices:
-                    choices = (self._fallback_choice,)
-                best = float("inf")
-                for choice in choices:
-                    if choice.raw_cost is not None:
-                        base = max(0.05, self._raw_cost_scale * float(choice.raw_cost))
-                    elif choice.cost is not None:
-                        base = float(choice.cost)
-                    else:
-                        base = 1.0
-                    best = min(best, base)
-                if best == float("inf"):
-                    best = 0.0
-                min_plan_cost += best
+            min_plan_cost = self._min_plan_cost(node)
             if self.disable_cpu_load_cost or self.cpu_cost_mode == "naive":
                 min_plan_cost = 0.0
             else:
@@ -1241,11 +1230,9 @@ class DPSolver:
         plan_map: Dict[tuple[str, str], QueryPlanChoice] = {}
         for node_id in cpu_nodes:
             node = self.graph.nodes[node_id]
-            if node.engine == "http":
-                total_cost += self._http_sleep_cost(node)
-                continue
-            if node.type == "processor":
-                total_cost += self._processor_cost(node)
+            fixed = self._fixed_cpu_cost(node)
+            if fixed is not None:
+                total_cost += fixed
                 continue
             if not getattr(node, "db_queries", None):
                 continue
@@ -1266,41 +1253,13 @@ class DPSolver:
             window = best_window
         return total_cost, plan_map
 
-    def _processor_cost(self, node: Node) -> float:
-        """Local-function 节点：使用 profiler 在规划前采样调用测得的平均延迟。"""
-        try:
-            return max(0.0, float(self._processor_latency_s.get(node.id, 0.0)))
-        except (TypeError, ValueError):
-            return 0.0
-
-    def _http_sleep_cost(self, node: Node) -> float:
-        if self._http_latency_s:
-            profiled = self._http_latency_s.get(node.id)
-            if profiled is not None:
-                try:
-                    return max(0.0, float(profiled))
-                except (TypeError, ValueError):
-                    pass
-        raw = node.raw if isinstance(node.raw, dict) else {}
-        for key, scale in (
-            ("sleep_s", 1.0),
-            ("sleep_ms", 0.001),
-            ("latency_s", 1.0),
-            ("latency_ms", 0.001),
-            ("timeout_s", 1.0),
-            ("timeout_ms", 0.001),
-        ):
-            if key not in raw:
-                continue
-            value = raw.get(key)
-            if isinstance(value, str):
-                value = value.strip()
-            try:
-                seconds = float(value) * scale
-            except (TypeError, ValueError):
-                continue
-            return max(0.0, seconds)
-        return 0.0
+    def _fixed_cpu_cost(self, node: Node) -> float | None:
+        """Profiled (or declared) latency of an HTTP / processor node; None for DB nodes."""
+        if node.engine == "http":
+            return http_cost(node, self._http_latency_s)
+        if node.type == "processor":
+            return self._processor_latency_s.get(node.id, 0.0)
+        return None
 
     def _order_cpu_nodes_by_parent_depth(
         self, cpu_nodes: Sequence[str], gpu_depths: Mapping[str, int]
@@ -1565,7 +1524,7 @@ class DPSolver:
             batch_mask |= 1 << self.node_index[node_id]
 
         needed = self._cpu_needed_for_gpu(gpu_nodes)
-        needed = self._expand_cpu_parents(needed | set(self._cpu_sink_ids))
+        needed = self._expand_cpu_parents(needed) | self._cpu_sink_closure
         pending = {
             nid
             for nid in self._db_node_ids
@@ -1622,18 +1581,24 @@ class DPSolver:
                     stack.append(parent)
         return expanded
 
-    def _cpu_cost_estimate(self, node_id: str) -> float:
-        """估计单个 CPU 节点的代价（HTTP/processor 用 profiled 延迟，DB 用各 query 最便宜计划之和）。"""
-        node = self.graph.nodes[node_id]
-        if node.engine == "http":
-            return self._http_sleep_cost(node)
-        if node.type == "processor":
-            return self._processor_cost(node)
+    def _min_plan_cost(self, node: Node) -> float:
+        """Sum over the node's queries of the cheapest plan's base cost."""
         total = 0.0
         for query in getattr(node, "db_queries", ()) or ():
-            choices = self.plan_choices.get((node_id, query.name)) or (self._fallback_choice,)
+            choices = self.plan_choices.get((node.id, query.name)) or (self._fallback_choice,)
             total += min(self._plan_base_cost(choice) for choice in choices)
         return total
+
+    def _cpu_cost_estimate(self, node_id: str) -> float:
+        """估计单个 CPU 节点的代价（HTTP/processor 用 profiled 延迟，DB 用各 query 最便宜计划之和）。"""
+        cost = self._cpu_cost_cache.get(node_id)
+        if cost is None:
+            node = self.graph.nodes[node_id]
+            cost = self._fixed_cpu_cost(node)
+            if cost is None:
+                cost = self._min_plan_cost(node)
+            self._cpu_cost_cache[node_id] = cost
+        return cost
 
     def _cpu_assignments(self, cpu_nodes: Sequence[str]) -> List[tuple[str, str]]:
         """CPU 节点映射到其可用 worker（按资源类别隔离，见 node_worker_options），
@@ -1647,10 +1612,14 @@ class DPSolver:
         count: Dict[str, int] = {}
         seq: List[tuple[str, str]] = []
         for node_id in cpu_nodes:
-            allowed = self.node_worker_options.get(node_id, workers)
-            eligible = tuple(w for w in workers if w in allowed) or workers
-            # Least estimated load; ties (e.g. no cost estimates) fall back to round-robin.
-            wid = min(eligible, key=lambda w: (load.get(w, 0.0), count.get(w, 0), eligible.index(w)))
+            eligible = self._cpu_eligible_cache.get(node_id)
+            if eligible is None:
+                allowed = self.node_worker_options.get(node_id, workers)
+                eligible = tuple(w for w in workers if w in allowed) or workers
+                self._cpu_eligible_cache[node_id] = eligible
+            # Least estimated load; ties (e.g. no cost estimates) fall back to round-robin
+            # (``min`` keeps the first of equal keys, i.e. worker order).
+            wid = min(eligible, key=lambda w: (load.get(w, 0.0), count.get(w, 0)))
             load[wid] = load.get(wid, 0.0) + self._cpu_cost_estimate(node_id)
             count[wid] = count.get(wid, 0) + 1
             seq.append((wid, node_id))

@@ -9,7 +9,7 @@ from typing import Any, Dict, List, MutableMapping, Sequence
 from .. import metrics
 from ..models import ExecutionPlan, GraphSpec, Node, is_llm_engine, llm_model_key
 from ..monitoring import ProgressMonitor, start_progress_monitor, start_system_monitor
-from ..worker import ResultMessage, TaskMessage, worker_process_loop
+from ..worker import ResultMessage, TaskMessage, engine_config, worker_process_loop
 from .base import BaseGraphProcessor, count_progress_nodes, is_progress_node
 
 
@@ -250,7 +250,7 @@ class OpwiseGraphProcessor(BaseGraphProcessor):
                 TaskMessage(
                     node_id="__CONFIG__",
                     node=None,
-                    config={"epoch": 0, "model": node.model or "", "engine": node.engine},
+                    config=engine_config(0, node),
                 )
             )
         pool.current_model = model_name

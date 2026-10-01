@@ -7,6 +7,8 @@ import re
 from typing import Any, Dict, List, Mapping, Sequence, Set, Tuple
 
 from .optimizers.dp import DPSolver, QuerySignature, WorkerState
+from .optimizers.topo_utils import default_worker_filter
+from .utils import http_cost
 from .optimizers import (
     build_greedy_cost_plan,
     build_min_switch_plan,
@@ -718,33 +720,7 @@ class GraphOptimizer:
         return exec_cost + switch_cost + load_cost
 
     def _http_exec_cost(self, node: Node) -> float:
-        if self._http_profile_latency:
-            profiled = self._http_profile_latency.get(node.id)
-            if profiled is not None:
-                try:
-                    return max(0.0, float(profiled))
-                except (TypeError, ValueError):
-                    pass
-        raw = node.raw if isinstance(node.raw, dict) else {}
-        for key, scale in (
-            ("sleep_s", 1.0),
-            ("sleep_ms", 0.001),
-            ("latency_s", 1.0),
-            ("latency_ms", 0.001),
-            ("timeout_s", 1.0),
-            ("timeout_ms", 0.001),
-        ):
-            if key not in raw:
-                continue
-            value = raw.get(key)
-            if isinstance(value, str):
-                value = value.strip()
-            try:
-                seconds = float(value) * scale
-            except (TypeError, ValueError):
-                continue
-            return max(0.0, seconds)
-        return 0.0
+        return http_cost(node, self._http_profile_latency)
 
     def _profile_graph(
         self,
@@ -965,12 +941,7 @@ class GraphOptimizer:
         return options
 
     def _worker_can_run(self, node: Node, worker: Worker) -> bool:
-        if is_llm_engine(node.engine):
-            return worker.kind == "gpu"
-        if node.engine in ("db", "http") or node.type == "db_query":
-            return worker.kind == "cpu"
-        # 默认认为非 LLM 节点跑在 CPU
-        return worker.kind == "cpu"
+        return default_worker_filter(node, worker)
 
     def _model_size_b(self, node: Node) -> float:
         """Best-effort parse of model size (in billions of params)."""

@@ -60,3 +60,41 @@ def as_bool(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in ("1", "true", "yes", "on")
     return bool(value)
+
+
+# Keys an HTTP operator may use to declare its latency, with their scale to seconds.
+HTTP_LATENCY_KEYS = (
+    ("sleep_s", 1.0),
+    ("sleep_ms", 0.001),
+    ("latency_s", 1.0),
+    ("latency_ms", 0.001),
+    ("timeout_s", 1.0),
+    ("timeout_ms", 0.001),
+)
+
+
+def http_latency_seconds(raw: Mapping[str, Any], render: Callable[[str], str] | None = None) -> float | None:
+    """The first parseable declared latency in ``raw`` (seconds, >= 0), or None."""
+    for key, scale in HTTP_LATENCY_KEYS:
+        if key not in raw:
+            continue
+        value = raw[key]
+        if isinstance(value, str):
+            value = (render(value) if render else value).strip()
+        try:
+            return max(0.0, float(value) * scale)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def http_cost(node: Any, profiled: Mapping[str, float] | None) -> float:
+    """Planning cost of an HTTP operator: its profiled latency, else the declared one."""
+    if profiled and profiled.get(node.id) is not None:
+        try:
+            return max(0.0, float(profiled[node.id]))
+        except (TypeError, ValueError):
+            pass
+    raw = node.raw if isinstance(node.raw, Mapping) else {}
+    seconds = http_latency_seconds(raw)
+    return 0.0 if seconds is None else seconds

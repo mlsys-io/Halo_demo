@@ -127,6 +127,8 @@ class GraphTemplateParser:
             if not node.db_queries and not calls:
                 new_nodes[node_id] = node
                 continue
+            pre_calls: List[Dict[str, Any]] = []
+            post_calls: List[Dict[str, Any]] = []
             for call in calls:
                 if not isinstance(call, dict) or not call.get("name"):
                     raise GraphValidationError(f"Node '{node_id}': every tool call needs a 'name'.")
@@ -134,11 +136,10 @@ class GraphTemplateParser:
                     raise GraphValidationError(
                         f"Node '{node_id}': tool call kind must be 'http' or 'processor' (got {call.get('kind')!r})."
                     )
+                (post_calls if as_bool(call.get("post_llm", False)) else pre_calls).append(call)
 
             pre_queries = [q for q in node.db_queries if not q.post_llm]
             post_queries = [q for q in node.db_queries if q.post_llm]
-            pre_calls = [c for c in calls if not as_bool(c.get("post_llm", False))]
-            post_calls = [c for c in calls if as_bool(c.get("post_llm", False))]
 
             # The LLM node's inputs gain the pre-LLM outputs so prompts can consume them.
             added_inputs: List[str] = []

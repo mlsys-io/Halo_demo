@@ -22,6 +22,7 @@ from ..worker import (
     ResultMessage,
     TaskMessage,
     cpu_worker_loop,
+    engine_config,
     worker_process_loop,
 )
 from .base import count_progress_nodes, is_progress_node
@@ -31,11 +32,6 @@ _RED = "\033[31m"
 _RESET = "\033[0m"
 
 _BRIDGE_STOP = object()
-
-
-def _engine_config(epoch: int, node: Node) -> Dict[str, Any]:
-    """``__CONFIG__`` payload telling a GPU worker which model / engine to host."""
-    return {"epoch": epoch, "model": node.model or "", "engine": node.engine}
 
 
 def _gpu_result_bridge(
@@ -539,7 +535,7 @@ class MultiProcessGraphProcessor:
                 cfg_msg = TaskMessage(
                     node_id="__CONFIG__",
                     node=None,
-                    config=_engine_config(task_map[preload_node].epoch, preload_spec),
+                    config=engine_config(task_map[preload_node].epoch, preload_spec),
                 )
                 task_queues[wid].put(cfg_msg)
                 last_model_by_worker[wid] = desired_model
@@ -672,7 +668,7 @@ class MultiProcessGraphProcessor:
                             cfg_msg = TaskMessage(
                                 node_id="__CONFIG__",
                                 node=None,
-                                config=_engine_config(task.epoch, node),
+                                config=engine_config(task.epoch, node),
                             )
                             task_queues[wid].put(cfg_msg)
                             last_model_by_worker[wid] = desired_model

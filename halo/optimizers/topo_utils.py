@@ -8,11 +8,7 @@ from ..models import GraphSpec, Node, Worker, build_dependency_list, is_llm_engi
 
 def default_worker_filter(node: Node, worker: Worker) -> bool:
     """Basic compatibility: LLM nodes (vLLM/SGLang) -> GPU, DB/HTTP/noop -> CPU."""
-    if is_llm_engine(node.engine):
-        return worker.kind == "gpu"
-    if node.engine in ("db", "http") or node.type == "db_query":
-        return worker.kind == "cpu"
-    return worker.kind == "cpu"
+    return worker.kind == ("gpu" if is_llm_engine(node.engine) else "cpu")
 
 
 def filtered_dependencies(

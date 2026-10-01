@@ -18,7 +18,7 @@ from . import metrics
 from .db import DatabaseExecutor, MissingQueryInputs, PostgresDatabaseExecutor, PostgresPlanExplainer, resolve_query_parameters
 from .engines import EngineProvider
 from .models import DBQuery, Node, is_llm_engine
-from .utils import MISSING, as_bool, lookup_path, maybe_parse_json, render_template
+from .utils import HTTP_LATENCY_KEYS, MISSING, as_bool, http_latency_seconds, lookup_path, maybe_parse_json, render_template
 from .node_processors import run_processor_node
 
 
@@ -133,9 +133,9 @@ class _BaseExecutor:
         reuse them; keys include the operator's full specification.
         """
         spec = _node_fingerprint(node)
-        signatures = [spec + signature_fn(node, ctx) for ctx in contexts]
-        results: Dict[str, Dict[str, Any]] = {}
-        owner: Dict[str, int] = {}
+        signatures = [(spec, signature_fn(node, ctx)) for ctx in contexts]
+        results: Dict[tuple[str, str], Dict[str, Any]] = {}
+        owner: Dict[tuple[str, str], int] = {}
         with self._stats_lock:
             for idx, sig in enumerate(signatures):
                 if sig in results or sig in owner:
@@ -178,6 +178,10 @@ _SQL_VOLATILE_RE = re.compile(
 )
 
 
+_DOLLAR_TAG_RE = re.compile(r"\$[A-Za-z_]\w*\$|\$\$")
+
+
+@lru_cache(maxsize=1024)
 def _strip_sql(sql: str) -> str:
     """Remove comments and replace literals / quoted identifiers by placeholders."""
     out: List[str] = []
@@ -204,7 +208,7 @@ def _strip_sql(sql: str) -> str:
             out.append(" '' " if ch == "'" else " ident ")
             i = j + 1
         elif ch == "$":
-            m = re.match(r"\$[A-Za-z_]\w*\$|\$\$", sql[i:])
+            m = _DOLLAR_TAG_RE.match(sql, i)
             if m:
                 tag = m.group(0)
                 j = sql.find(tag, i + len(tag))
@@ -250,17 +254,25 @@ def _stable_json(value: Any) -> str:
 
 def _node_fingerprint(node: Node) -> str:
     """The operator's full specification, so different operators never share results."""
-    return _stable_json([node.id, node.type, node.engine, list(node.inputs), list(node.outputs), node.raw])
+    key = id(node)
+    cached = _FINGERPRINTS.get(key)
+    if cached is None or cached[0] is not node:
+        spec = _stable_json([node.id, node.type, node.engine, list(node.inputs), list(node.outputs), node.raw])
+        if len(_FINGERPRINTS) >= _COALESCE_CACHE_SIZE:
+            _FINGERPRINTS.clear()
+        cached = _FINGERPRINTS[key] = (node, spec)
+    return cached[1]
+
+
+# id(node) -> (node, fingerprint); holding the node keeps its id from being reused.
+_FINGERPRINTS: Dict[int, tuple[Node, str]] = {}
 
 
 def _input_signature(node: Node, context: Mapping[str, Any], extra: Mapping[str, Any] | None = None) -> str:
     """Signature of a tool call: its bound inputs (the whole context when none are
     declared, since the operator may read any field) and rendered request fields."""
     if node.inputs:
-        values = {}
-        for name in node.inputs:
-            value = lookup_path(context, name)
-            values[name] = None if value is MISSING else value
+        values = {name: (None if (v := lookup_path(context, name)) is MISSING else v) for name in node.inputs}
     else:
         values = dict(context)
     return _stable_json([values, extra or {}])
@@ -278,18 +290,13 @@ def _render_nested(value: Any, context: Mapping[str, Any]) -> Any:
 
 # Request-defining fields of an HTTP operator (rendered against the query context).
 _HTTP_REQUEST_FIELDS = (
-    "url", "method", "params", "query", "body", "json", "headers",
-    "sleep_s", "sleep_ms", "latency_s", "latency_ms", "timeout_s", "timeout_ms",
+    "url", "method", "params", "query", "body", "json", "headers", *(key for key, _ in HTTP_LATENCY_KEYS),
 )
 
 
 def _http_signature(node: Node, context: Mapping[str, Any]) -> str:
     raw = node.raw if isinstance(node.raw, Mapping) else {}
-    request: Dict[str, Any] = {}
-    for key in _HTTP_REQUEST_FIELDS:
-        if key not in raw:
-            continue
-        request[key] = _render_nested(raw[key], context)
+    request = {key: _render_nested(raw[key], context) for key in _HTTP_REQUEST_FIELDS if key in raw}
     return _input_signature(node, context, request)
 
 
@@ -756,12 +763,7 @@ class HTTPNodeExecutor(_BaseExecutor):
             self._thread_pool = ThreadPoolExecutor(max_workers=self.http_concurrency)
 
     def execute(self, node: Node, context: Mapping[str, Any]) -> Dict[str, Any]:
-        self._begin_execution()
-        if node.engine != "http":
-            raise RuntimeError(f"HTTPNodeExecutor only supports engine='http' (got {node.engine})")
-        if coalescing_enabled(node):  # per-query processors still reuse cached results
-            return self._execute_coalesced(node, [context], _http_signature, self._execute_http_once)[0]
-        return self._execute_http_once(node, context)
+        return self.execute_batch(node, [context])[0]
 
     def execute_batch(
         self,
@@ -799,27 +801,8 @@ class HTTPNodeExecutor(_BaseExecutor):
         return self._build_outputs(node, sleep_s)
 
     def _resolve_sleep_seconds(self, node: Node, context: Mapping[str, Any]) -> float:
-        raw = node.raw or {}
-        keys = (
-            ("sleep_s", 1.0),
-            ("sleep_ms", 0.001),
-            ("latency_s", 1.0),
-            ("latency_ms", 0.001),
-            ("timeout_s", 1.0),
-            ("timeout_ms", 0.001),
-        )
-        for key, scale in keys:
-            if key not in raw:
-                continue
-            value = raw.get(key)
-            if isinstance(value, str):
-                value = render_template(value, context).strip()
-            try:
-                seconds = float(value) * scale
-            except (TypeError, ValueError):
-                continue
-            return max(0.0, seconds)
-        return self.default_sleep_s
+        seconds = http_latency_seconds(node.raw or {}, render=lambda v: render_template(v, context))
+        return self.default_sleep_s if seconds is None else seconds
 
     def _sample_sleep_seconds(self, mean_sleep_s: float) -> float:
         if mean_sleep_s <= 0:
@@ -847,14 +830,7 @@ class ProcessorNodeExecutor(_BaseExecutor):
     """Handles local processor nodes (non-LLM, non-DB)."""
 
     def execute(self, node: Node, context: Mapping[str, Any]) -> Dict[str, Any]:
-        self._begin_execution()
-        if node.type != "processor":
-            raise RuntimeError(
-                f"ProcessorNodeExecutor only supports type='processor' (got type={node.type})"
-            )
-        if coalescing_enabled(node):  # per-query processors still reuse cached results
-            return self._execute_coalesced(node, [context], _input_signature, run_processor_node)[0]
-        return run_processor_node(node, context)
+        return self.execute_batch(node, [context])[0]
 
     def execute_batch(
         self,

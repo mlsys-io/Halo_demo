@@ -42,6 +42,11 @@ class ResultMessage:
     stats: Dict[str, Any] | None = None
 
 
+
+def engine_config(epoch: int, node: Node) -> Dict[str, Any]:
+    """``__CONFIG__`` payload telling a GPU worker which model / engine to host."""
+    return {"epoch": epoch, "model": node.model or "", "engine": node.engine}
+
 def configure_device_env(device: str) -> None:
     """根据 Worker.device 配置环境（例如 CUDA_VISIBLE_DEVICES）。"""
     if device.startswith("cuda:"):

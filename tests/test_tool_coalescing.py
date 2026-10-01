@@ -265,7 +265,7 @@ def test_processor_nodes_are_profiled_into_dp_cost(monkeypatch):
     assert profile.processor_samples["extract"] == 2
     solver = DPSolver.__new__(DPSolver)
     solver._processor_latency_s = dict(profile.processor_latencies_s)
-    assert solver._processor_cost(node) == profile.processor_latencies_s["extract"]
+    assert solver._fixed_cpu_cost(node) == profile.processor_latencies_s["extract"]
 
 
 # ---- review fixes: SQL safety, cache keys, parser inputs, streaming, profiling ----

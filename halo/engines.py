@@ -312,7 +312,6 @@ class SGLangEngine:
 
         known_pids = {proc.pid for proc in _child_processes()}
         self._engine = None
-        self._procs: List[Any] = []
         try:
             self._engine = sgl.Engine(model_path=model, **engine_args)
         except ImportError as exc:  # e.g. a frontend-only `sglang` without its runtime deps
@@ -321,7 +320,7 @@ class SGLangEngine:
             ) from exc
         finally:
             # Scheduler/detokenizer subprocesses of this engine (also on a failed start).
-            self._procs = [proc for proc in _child_processes() if proc.pid not in known_pids]
+            self._procs: List[Any] = [proc for proc in _child_processes() if proc.pid not in known_pids]
             if self._engine is None:
                 _kill_and_wait(self._procs)
         self._default_sampling = sampling_defaults
@@ -365,42 +364,32 @@ class SGLangEngine:
         _kill_and_wait(procs)
 
 
-def make_vllm_provider(*, allow_tensor_parallel: bool = False, **engine_kwargs: Any) -> EngineProvider:
-    """Convenience helper for creating a VLLM-backed provider (per worker-process)."""
+# node.engine -> (engine class name, label); classes are looked up at build time.
+_LLM_ENGINES = {"vllm": ("VLLMEngine", "VLLM"), "sglang": ("SGLangEngine", "SGLang")}
+
+
+def _engine_factory(engine: str, allow_tensor_parallel: bool, engine_kwargs: Dict[str, Any]) -> Callable[[Node], LLMEngine]:
+    """Factory building the engine class for nodes with ``node.engine == engine``."""
+    cls_name, label = _LLM_ENGINES[engine]
 
     def factory(node: Node) -> LLMEngine:
-        if node.engine != "vllm":
-            raise ValueError(
-                f"Cannot build VLLM engine for node '{node.id}' with engine {node.engine}"
-            )
+        if node.engine != engine:
+            raise ValueError(f"Cannot build {label} engine for node '{node.id}' with engine {node.engine}")
         if not node.model:
             raise ValueError(f"Node '{node.id}' is missing a model name.")
-        return VLLMEngine(
-            model=node.model,
-            allow_tensor_parallel=allow_tensor_parallel,
-            **engine_kwargs,
-        )
+        return globals()[cls_name](model=node.model, allow_tensor_parallel=allow_tensor_parallel, **engine_kwargs)
 
-    return EngineProvider(factory=factory)
+    return factory
+
+
+def make_vllm_provider(*, allow_tensor_parallel: bool = False, **engine_kwargs: Any) -> EngineProvider:
+    """Convenience helper for creating a VLLM-backed provider (per worker-process)."""
+    return EngineProvider(factory=_engine_factory("vllm", allow_tensor_parallel, engine_kwargs))
 
 
 def make_sglang_provider(*, allow_tensor_parallel: bool = False, **engine_kwargs: Any) -> EngineProvider:
     """Convenience helper for creating an SGLang-backed provider (per worker-process)."""
-
-    def factory(node: Node) -> LLMEngine:
-        if node.engine != "sglang":
-            raise ValueError(
-                f"Cannot build SGLang engine for node '{node.id}' with engine {node.engine}"
-            )
-        if not node.model:
-            raise ValueError(f"Node '{node.id}' is missing a model name.")
-        return SGLangEngine(
-            model=node.model,
-            allow_tensor_parallel=allow_tensor_parallel,
-            **engine_kwargs,
-        )
-
-    return EngineProvider(factory=factory)
+    return EngineProvider(factory=_engine_factory("sglang", allow_tensor_parallel, engine_kwargs))
 
 
 def make_llm_provider(*, allow_tensor_parallel: bool = False, **engine_kwargs: Any) -> EngineProvider:
@@ -408,10 +397,7 @@ def make_llm_provider(*, allow_tensor_parallel: bool = False, **engine_kwargs: A
 
     ``engine_kwargs`` use vLLM names; SGLangEngine maps them to SGLang's.
     """
-    factories = {
-        "vllm": make_vllm_provider(allow_tensor_parallel=allow_tensor_parallel, **engine_kwargs).factory,
-        "sglang": make_sglang_provider(allow_tensor_parallel=allow_tensor_parallel, **engine_kwargs).factory,
-    }
+    factories = {name: _engine_factory(name, allow_tensor_parallel, engine_kwargs) for name in _LLM_ENGINES}
 
     def factory(node: Node) -> LLMEngine:
         build = factories.get(node.engine)

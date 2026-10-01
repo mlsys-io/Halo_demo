@@ -73,12 +73,17 @@ class StreamingSession:
         self, buffered: List[Tuple[int, GraphSpec, Dict[str, Any]]]
     ) -> List[Tuple[GraphSpec, List[Tuple[int, Dict[str, Any]]]]]:
         segments: List[Tuple[GraphSpec, List[Tuple[int, Dict[str, Any]]]]] = []
+        keys: Dict[int, str] = {}  # one structural hash per distinct GraphSpec object
+        prev_key = None
         for ticket, graph, ctx in buffered:
-            same_template = segments and self._template_key(segments[-1][0]) == self._template_key(graph)
-            if same_template and (self.max_batch is None or len(segments[-1][1]) < self.max_batch):
+            key = keys.get(id(graph))
+            if key is None:
+                key = keys[id(graph)] = self._template_key(graph)
+            if key == prev_key and (self.max_batch is None or len(segments[-1][1]) < self.max_batch):
                 segments[-1][1].append((ticket, ctx))
             else:
                 segments.append((graph, [(ticket, ctx)]))
+                prev_key = key
         return segments
 
     def _plan_for(self, graph: GraphSpec, contexts: List[Dict[str, Any]]) -> ExecutionPlan:

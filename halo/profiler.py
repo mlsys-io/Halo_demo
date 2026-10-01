@@ -93,9 +93,8 @@ class GraphProfiler:
                 total = float(stats.get("api_time") or stats.get("http_time") or stats.get("db_time") or 0.0)
                 if calls <= 0:
                     continue
-                avg_latency = total / calls
-                results[node.id] = max(0.0, avg_latency)
-                samples[node.id] = max(1, calls)
+                results[node.id] = total / calls
+                samples[node.id] = calls
             except Exception:
                 LOGGER.exception("Failed to profile HTTP node %s", node.id)
 
@@ -124,7 +123,7 @@ class GraphProfiler:
                 # Inputs produced by upstream operators are not available before planning.
                 LOGGER.debug("Could not profile processor node %s", node.id, exc_info=True)
                 continue
-            results[node.id] = max(0.0, elapsed / len(context_list))
+            results[node.id] = elapsed / len(context_list)
             samples[node.id] = len(context_list)
 
         return results, samples
