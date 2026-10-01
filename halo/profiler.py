@@ -79,20 +79,21 @@ class GraphProfiler:
         if not http_nodes:
             return {}, {}
 
-        context_list = list(contexts) if contexts else [{}]
+        context_list = [dict(ctx) for ctx in contexts] if contexts else [{}]
         executor = self._ensure_http_executor()
         results: Dict[str, float] = {}
         samples: Dict[str, int] = {}
 
         for node in http_nodes:
             try:
+                executor.clear_caches()  # measure real calls, not cached coalesced results
                 executor.execute_batch(node, context_list)
                 stats = executor.consume_stats()
                 calls = int(stats.get("api_calls") or stats.get("http_calls") or stats.get("db_calls") or 0)
                 total = float(stats.get("api_time") or stats.get("http_time") or stats.get("db_time") or 0.0)
                 if calls <= 0:
-                    calls = len(context_list)
-                avg_latency = total / max(1, calls)
+                    continue
+                avg_latency = total / calls
                 results[node.id] = max(0.0, avg_latency)
                 samples[node.id] = max(1, calls)
             except Exception:
@@ -117,7 +118,7 @@ class GraphProfiler:
             try:
                 start = time.perf_counter()
                 for ctx in context_list:
-                    run_processor_node(node, ctx)
+                    run_processor_node(node, dict(ctx))
                 elapsed = time.perf_counter() - start
             except Exception:
                 # Inputs produced by upstream operators are not available before planning.

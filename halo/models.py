@@ -40,6 +40,8 @@ class DBQuery:
     required_inputs: Sequence[str] = field(default_factory=tuple)
     param_types: Dict[str, str] = field(default_factory=dict)
     plans: Sequence["QueryPlanOption"] = field(default_factory=tuple)
+    # ``coalesce: false`` opts a read out of sharing (e.g. it calls a volatile UDF).
+    coalesce: bool = True
 
 
 @dataclass(frozen=True, slots=True)

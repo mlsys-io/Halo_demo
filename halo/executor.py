@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -17,7 +18,7 @@ from . import metrics
 from .db import DatabaseExecutor, MissingQueryInputs, PostgresDatabaseExecutor, PostgresPlanExplainer, resolve_query_parameters
 from .engines import EngineProvider
 from .models import DBQuery, Node, is_llm_engine
-from .utils import MISSING, lookup_path, maybe_parse_json, render_template
+from .utils import MISSING, as_bool, lookup_path, maybe_parse_json, render_template
 from .node_processors import run_processor_node
 
 
@@ -72,6 +73,11 @@ class _BaseExecutor:
         self._stats_lock = threading.Lock()
         self._coalesce_cache = OrderedDict()
 
+    def clear_caches(self) -> None:
+        """Drop results kept across micro-batches (e.g. after a write)."""
+        with self._stats_lock:
+            self._coalesce_cache.clear()
+
     def _begin_execution(self) -> None:
         with self._stats_lock:
             self._stats.clear()
@@ -122,11 +128,12 @@ class _BaseExecutor:
         """Run ``run_once`` once per distinct signature and fan the result out.
 
         Only used for operators declared ``coalesce: true`` (deterministic and
-        side-effect free); every context receives its own shallow copy. Results
-        are also kept in a bounded cache so identical calls in later micro-batches
-        reuse them.
+        side-effect free); every context receives its own deep copy. Results are
+        also kept in a bounded cache so identical calls in later micro-batches
+        reuse them; keys include the operator's full specification.
         """
-        signatures = [signature_fn(node, ctx) for ctx in contexts]
+        spec = _node_fingerprint(node)
+        signatures = [spec + signature_fn(node, ctx) for ctx in contexts]
         results: Dict[str, Dict[str, Any]] = {}
         owner: Dict[str, int] = {}
         with self._stats_lock:
@@ -152,47 +159,121 @@ class _BaseExecutor:
                 self._coalesce_cache.move_to_end(sig)
             while len(self._coalesce_cache) > _COALESCE_CACHE_SIZE:
                 self._coalesce_cache.popitem(last=False)
-        return [dict(results[sig]) for sig in signatures]
+        return [copy.deepcopy(results[sig]) for sig in signatures]
 
 
+_SQL_READ_STARTS = ("select", "with", "values", "table")
 _SQL_WRITE_RE = re.compile(
-    r"\b(insert|update|delete|merge|upsert|create|drop|alter|truncate|grant|revoke|copy|call|do|lock|vacuum|refresh)\b",
+    r"\b(insert|update|delete|merge|upsert|create|drop|alter|truncate|grant|revoke|copy|call|do|lock|vacuum|"
+    r"refresh|into|notify|listen|set|reset|discard|prepare|execute|tablesample)\b",
     re.IGNORECASE,
 )
+# Volatile or side-effecting functions (called with parentheses) and volatile keywords.
 _SQL_VOLATILE_RE = re.compile(
-    r"\b(random|now|clock_timestamp|statement_timestamp|transaction_timestamp|timeofday|current_timestamp|"
-    r"localtimestamp|current_time|localtime|nextval|setval|currval|lastval|gen_random_uuid|uuid_generate_v[14]|"
-    r"txid_current|pg_sleep)\b",
+    r"(?<![\w:$.])(random|now|clock_timestamp|statement_timestamp|transaction_timestamp|timeofday|nextval|setval|"
+    r"currval|lastval|setseed|set_config|gen_random_\w+|uuid_generate_\w+|txid_\w+|pg_current_xact_id\w*|"
+    r"pg_advisory\w*|pg_try_advisory\w*|pg_notify|pg_sleep\w*|dblink\w*|lo_\w+)\s*\("
+    r"|(?<![\w:$.])(current_timestamp|localtimestamp|current_time|localtime)\b",
     re.IGNORECASE,
 )
+
+
+def _strip_sql(sql: str) -> str:
+    """Remove comments and replace literals / quoted identifiers by placeholders."""
+    out: List[str] = []
+    i, n = 0, len(sql)
+    while i < n:
+        ch = sql[i]
+        if ch == "-" and sql.startswith("--", i):
+            j = sql.find("\n", i)
+            i = n if j < 0 else j
+            out.append(" ")
+        elif ch == "/" and sql.startswith("/*", i):
+            j = sql.find("*/", i + 2)
+            i = n if j < 0 else j + 2
+            out.append(" ")
+        elif ch in ("'", '"'):
+            j = i + 1
+            while j < n:
+                if sql[j] == ch:
+                    if j + 1 < n and sql[j + 1] == ch:  # doubled quote escape
+                        j += 2
+                        continue
+                    break
+                j += 1
+            out.append(" '' " if ch == "'" else " ident ")
+            i = j + 1
+        elif ch == "$":
+            m = re.match(r"\$[A-Za-z_]\w*\$|\$\$", sql[i:])
+            if m:
+                tag = m.group(0)
+                j = sql.find(tag, i + len(tag))
+                i = n if j < 0 else j + len(tag)
+                out.append(" '' ")
+            else:
+                out.append(ch)
+                i += 1
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
+@lru_cache(maxsize=1024)
+def sql_is_write(sql: str) -> bool:
+    """Statements that may modify database state (anything not a plain read)."""
+    text = _strip_sql(sql).lstrip(" \t\r\n(")
+    words = text.split(None, 1)
+    if not words or words[0].lower() not in _SQL_READ_STARTS:
+        return True
+    return bool(_SQL_WRITE_RE.search(text))
 
 
 @lru_cache(maxsize=1024)
 def sql_coalescible(sql: str) -> bool:
     """Only read-only statements without volatile functions may share one execution."""
-    text = re.sub(r"--[^\n]*|/\*.*?\*/", " ", sql, flags=re.DOTALL)
-    text = re.sub(r"'(?:[^']|'')*'", "''", text)
-    words = text.split(None, 1)
-    if not words or words[0].lower() not in ("select", "with", "values", "table"):
-        return False
-    return not (_SQL_WRITE_RE.search(text) or _SQL_VOLATILE_RE.search(text))
+    return not sql_is_write(sql) and not _SQL_VOLATILE_RE.search(_strip_sql(sql))
 
 
 def coalescing_enabled(node: Node) -> bool:
     """A tool operator is coalesced only when the template declares it deterministic."""
     raw = node.raw if isinstance(node.raw, Mapping) else {}
-    return bool(raw.get("coalesce", False))
+    return as_bool(raw.get("coalesce", False))
+
+
+def _stable_json(value: Any) -> str:
+    try:
+        return json.dumps(value, sort_keys=True, default=repr, ensure_ascii=False)
+    except TypeError:  # e.g. dict keys of mixed types
+        return repr(value)
+
+
+def _node_fingerprint(node: Node) -> str:
+    """The operator's full specification, so different operators never share results."""
+    return _stable_json([node.id, node.type, node.engine, list(node.inputs), list(node.outputs), node.raw])
 
 
 def _input_signature(node: Node, context: Mapping[str, Any], extra: Mapping[str, Any] | None = None) -> str:
-    """Signature of a tool call: operator id, its bound inputs, and request fields."""
-    payload: Dict[str, Any] = {"node": node.id}
-    for name in node.inputs:
-        value = lookup_path(context, name)
-        payload[name] = None if value is MISSING else value
-    if extra:
-        payload["request"] = dict(extra)
-    return json.dumps(payload, sort_keys=True, default=str, ensure_ascii=False)
+    """Signature of a tool call: its bound inputs (the whole context when none are
+    declared, since the operator may read any field) and rendered request fields."""
+    if node.inputs:
+        values = {}
+        for name in node.inputs:
+            value = lookup_path(context, name)
+            values[name] = None if value is MISSING else value
+    else:
+        values = dict(context)
+    return _stable_json([values, extra or {}])
+
+
+def _render_nested(value: Any, context: Mapping[str, Any]) -> Any:
+    if isinstance(value, str):
+        return render_template(value, context)
+    if isinstance(value, Mapping):
+        return {k: _render_nested(v, context) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_render_nested(v, context) for v in value]
+    return value
 
 
 # Request-defining fields of an HTTP operator (rendered against the query context).
@@ -208,8 +289,7 @@ def _http_signature(node: Node, context: Mapping[str, Any]) -> str:
     for key in _HTTP_REQUEST_FIELDS:
         if key not in raw:
             continue
-        value = raw[key]
-        request[key] = render_template(value, context) if isinstance(value, str) else value
+        request[key] = _render_nested(raw[key], context)
     return _input_signature(node, context, request)
 
 
@@ -227,7 +307,7 @@ class DBNodeExecutor(_BaseExecutor):
     db_explain_mode: str = "wrap"  # "wrap" (run + explain) or "replace" (explain only)
     db_explain_sample_rate: float = 1.0
     _thread_pool: ThreadPoolExecutor | None = field(init=False, repr=False, default=None)
-    _result_cache: "OrderedDict[tuple[str, tuple], Mapping[str, Any]]" = field(init=False, repr=False)
+    _result_cache: "OrderedDict[tuple, Mapping[str, Any]]" = field(init=False, repr=False)
     _result_cache_lock: threading.Lock = field(init=False, repr=False)
     _plan_explainer: PostgresPlanExplainer | None = field(init=False, repr=False, default=None)
 
@@ -327,13 +407,17 @@ class DBNodeExecutor(_BaseExecutor):
             return self._run_db_queries_no_cache(node, contexts, queries)
 
         results_per_context: List[List[Mapping[str, Any]]] = [[] for _ in range(num_contexts)]
-        batch_result_cache: Dict[tuple[str, str], Mapping[str, Any]] = {}
+        batch_result_cache: Dict[tuple, Mapping[str, Any]] = {}
 
         for query in queries:
-            if not sql_coalescible(query.sql):
+            if not (query.coalesce and sql_coalescible(query.sql)):
                 # Writes / volatile functions run once per query (no sharing, no cache).
                 for idx, results in enumerate(self._run_db_queries_no_cache(node, contexts, [query])):
                     results_per_context[idx].extend(results)
+                if sql_is_write(query.sql):
+                    # Later reads must observe the write.
+                    batch_result_cache.clear()
+                    self.clear_caches()
                 continue
             per_ctx_params: List[tuple[Dict[str, Any], bool]] = []
             signature_owner: Dict[str, int] = {}
@@ -348,9 +432,9 @@ class DBNodeExecutor(_BaseExecutor):
                 if signature not in signature_owner:
                     signature_owner[signature] = idx
 
-            to_run: List[tuple[tuple[str, str], int, Dict[str, Any]]] = []
+            to_run: List[tuple[tuple, int, Dict[str, Any]]] = []
             for signature, ctx_idx in signature_owner.items():
-                cache_key = (query.name, signature)
+                cache_key = (query.name, query.sql, signature)
                 cached = batch_result_cache.get(cache_key) or self._get_cached_result(cache_key)
                 if cached is not None:
                     continue
@@ -380,7 +464,7 @@ class DBNodeExecutor(_BaseExecutor):
                     results_per_context[idx].append(self._make_missing_query_result(query, params))
                     continue
                 signature = self._serialize_parameters(params)
-                cache_key = (query.name, signature)
+                cache_key = (query.name, query.sql, signature)
                 result = batch_result_cache.get(cache_key) or self._get_cached_result(cache_key)
                 if result is None:
                     context = contexts[idx]
@@ -443,7 +527,12 @@ class DBNodeExecutor(_BaseExecutor):
 
         return results_per_context
 
-    def _cache_result(self, cache_key: tuple[str, str], result: Mapping[str, Any]) -> None:
+    def clear_caches(self) -> None:
+        _BaseExecutor.clear_caches(self)
+        with self._result_cache_lock:
+            self._result_cache.clear()
+
+    def _cache_result(self, cache_key: tuple, result: Mapping[str, Any]) -> None:
         """Store a result in the instance-level LRU cache."""
         if not self.enable_result_cache or self.result_cache_size <= 0:
             return
@@ -453,7 +542,7 @@ class DBNodeExecutor(_BaseExecutor):
             while len(self._result_cache) > self.result_cache_size:
                 self._result_cache.popitem(last=False)
 
-    def _get_cached_result(self, cache_key: tuple[str, str]) -> Mapping[str, Any] | None:
+    def _get_cached_result(self, cache_key: tuple) -> Mapping[str, Any] | None:
         if not self.enable_result_cache or self.result_cache_size <= 0:
             return None
         with self._result_cache_lock:
@@ -670,6 +759,8 @@ class HTTPNodeExecutor(_BaseExecutor):
         self._begin_execution()
         if node.engine != "http":
             raise RuntimeError(f"HTTPNodeExecutor only supports engine='http' (got {node.engine})")
+        if coalescing_enabled(node):  # per-query processors still reuse cached results
+            return self._execute_coalesced(node, [context], _http_signature, self._execute_http_once)[0]
         return self._execute_http_once(node, context)
 
     def execute_batch(
@@ -761,6 +852,8 @@ class ProcessorNodeExecutor(_BaseExecutor):
             raise RuntimeError(
                 f"ProcessorNodeExecutor only supports type='processor' (got type={node.type})"
             )
+        if coalescing_enabled(node):  # per-query processors still reuse cached results
+            return self._execute_coalesced(node, [context], _input_signature, run_processor_node)[0]
         return run_processor_node(node, context)
 
     def execute_batch(

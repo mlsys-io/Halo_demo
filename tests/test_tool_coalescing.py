@@ -18,6 +18,7 @@ from halo.executor import HTTPNodeExecutor, ProcessorNodeExecutor, sql_coalescib
 from halo.models import Node  # noqa: E402
 
 # Planning must not sleep in HTTP profiling.
+_REAL_PROFILE_HTTP = profiler.GraphProfiler._profile_http_nodes
 profiler.GraphProfiler._profile_http_nodes = lambda self, graph, contexts: ({}, {})
 
 
@@ -190,7 +191,7 @@ def test_parser_extracts_embedded_tool_calls(tmp_path):
     assert {t.node_id for t in plan.tasks} >= {"analyst", "analyst__pre__news", "analyst__post__extract"}
 
 
-def test_streaming_session_replans_only_when_template_changes():
+def test_streaming_session_replans_every_mini_batch():
     from halo.models import GraphSpec
     from halo.streaming import StreamingSession
 
@@ -219,8 +220,8 @@ def test_streaming_session_replans_only_when_template_changes():
     assert [results[t]["answer"] for t in tickets] == [0, 1, 2, 3, 4, 5]
     # Mini-batches respect template boundaries and the size cap.
     assert proc.batches == [("plan:t1", 2), ("plan:t1", 1), ("plan:t2", 2), ("plan:t1", 1)]
-    # The optimizer runs once per template; returning to t1 reuses its plan.
-    assert [name for name, _ in opt.calls] == ["t1", "t2"] and session.optimizer_runs == 2
+    # The optimizer re-runs at every mini-batch boundary, sized to that mini-batch.
+    assert opt.calls == [("t1", 2), ("t1", 1), ("t2", 2), ("t1", 1)] and session.optimizer_runs == 4
 
 
 def test_auto_micro_batch_size_is_half_the_batch():
@@ -265,3 +266,230 @@ def test_processor_nodes_are_profiled_into_dp_cost(monkeypatch):
     solver = DPSolver.__new__(DPSolver)
     solver._processor_latency_s = dict(profile.processor_latencies_s)
     assert solver._processor_cost(node) == profile.processor_latencies_s["extract"]
+
+
+# ---- review fixes: SQL safety, cache keys, parser inputs, streaming, profiling ----
+
+
+class _StockDB:
+    """Fake DB with one counter: UPDATE decrements it, SELECT reads it."""
+
+    def __init__(self):
+        self.qty = 9
+        self.calls = []
+
+    def run(self, query, context, *, node_id=None):
+        self.calls.append(query.name)
+        if query.sql.lstrip().upper().startswith("UPDATE"):
+            self.qty -= 1
+            return {"query": query.name, "rows": []}
+        return {"query": query.name, "rows": [{"v": f"{query.name}:{self.qty}"}]}
+
+
+def _db_node(node_id, *queries):
+    from halo.models import DBQuery
+
+    dbq = tuple(DBQuery(name=n, sql=sql, parameters={"id": "id"}) for n, sql in queries)
+    return Node(id=node_id, type="db_query", engine="db", model=None, inputs=("id",), outputs=(),
+                db_queries=dbq, raw={})
+
+
+def test_sql_classifier_handles_literals_and_side_effects():
+    assert not sql_coalescible("WITH c AS (SELECT * FROM s WHERE sep = '--') UPDATE t SET q = 1 RETURNING q")
+    assert not sql_coalescible("SELECT COALESCE(note, '--'), nextval('seq') FROM t")
+    assert not sql_coalescible("SELECT * INTO backup FROM t")
+    assert not sql_coalescible("SELECT pg_advisory_lock(1)")
+    assert sql_coalescible("SELECT * FROM t WHERE d < :now")
+    assert sql_coalescible('SELECT "update" FROM t')
+    assert sql_coalescible("(SELECT a FROM t) UNION (SELECT a FROM u)")
+
+
+def test_write_invalidates_cached_reads():
+    from halo.executor import DBNodeExecutor
+
+    db = _StockDB()
+    executor = DBNodeExecutor(db_executor=db, db_concurrency=1)
+    node = _db_node("stock", ("dec", "UPDATE stock SET qty = qty - 1 WHERE id = :id"),
+                    ("read", "SELECT qty FROM stock WHERE id = :id"))
+    seen = [executor.execute_batch(node, [{"id": 7}])[0]["read"]["rows"][0]["v"] for _ in range(3)]
+    assert seen == ["read:8", "read:7", "read:6"]
+
+
+def test_db_cache_distinguishes_sql_with_same_query_name():
+    from halo.executor import DBNodeExecutor
+
+    executor = DBNodeExecutor(db_executor=_StockDB(), db_concurrency=1)
+    a = executor.execute_batch(_db_node("movie", ("lookup", "SELECT title FROM movies WHERE id = :id")), [{"id": 1}])
+    db = executor.db_executor
+    executor.execute_batch(_db_node("actor", ("lookup", "SELECT name FROM actors WHERE id = :id")), [{"id": 1}])
+    assert db.calls == ["lookup", "lookup"] and a
+
+
+def test_coalescing_key_covers_operator_spec_and_nested_requests(monkeypatch):
+    import halo.executor as executor_mod
+
+    monkeypatch.setattr(executor_mod, "run_processor_node",
+                        lambda node, ctx: {node.outputs[0]: node.raw["config"]["tag"] + ctx["x"]})
+    executor = ProcessorNodeExecutor()
+
+    def proc(tag, out):
+        return Node(id="extract", type="processor", engine=None, model=None, inputs=("x",), outputs=(out,),
+                    db_queries=(), raw={"processor": "p", "config": {"tag": tag}, "coalesce": True})
+
+    assert executor.execute_batch(proc("A", "a"), [{"x": "1"}])[0] == {"a": "A1"}
+    assert executor.execute_batch(proc("B", "b"), [{"x": "1"}])[0] == {"b": "B1"}  # not A's cached result
+
+    http = HTTPNodeExecutor(http_concurrency=1)
+    node = _http_node(coalesce=True, headers={"Authorization": "Bearer {{ token }}"})
+    http.execute_batch(node, [{"ticker": "AAPL", "token": t} for t in ("alice", "bob")])
+    assert http.consume_stats()["api_calls"] == 2
+
+
+def test_coalesced_outputs_are_independent_copies(monkeypatch):
+    import halo.executor as executor_mod
+
+    monkeypatch.setattr(executor_mod, "run_processor_node", lambda node, ctx: {"out": {"v": ctx["x"]}})
+    node = Node(id="p", type="processor", engine=None, model=None, inputs=("x",), outputs=("out",),
+                db_queries=(), raw={"processor": "p", "coalesce": "true"})
+    outs = ProcessorNodeExecutor().execute_batch(node, [{"x": 1}, {"x": 1}])
+    assert outs[0]["out"] == outs[1]["out"] and outs[0]["out"] is not outs[1]["out"]
+    off = Node(id="q", type="processor", engine=None, model=None, inputs=("x",), outputs=("out",),
+               db_queries=(), raw={"processor": "p", "coalesce": "false"})
+    from halo.executor import coalescing_enabled
+    assert not coalescing_enabled(off)
+
+
+TOOLS_WITH_DB_TEMPLATE = textwrap.dedent(
+    """
+    graph:
+      name: tools_with_db
+      nodes:
+        - id: user_input
+          type: input
+          outputs: [user_query]
+        - id: analyst
+          type: inference
+          engine: vllm
+          model: meta-llama/Llama-3.2-3B-Instruct
+          system_prompt: "Analyze."
+          inputs: [user_query]
+          outputs: [report]
+          db_queries:
+            - {name: q, sql: "SELECT 1 WHERE :x = :x", parameters: {x: user_query}}
+          tool_calls:
+            - {name: news, kind: http, sleep_ms: 1}
+            - {name: extract, kind: processor, processor: regex_param_extractor, config: {}, post_llm: true}
+      edges:
+        - {from: user_input, to: analyst, mapping: {user_query: "{{ user_query }}"}}
+    """
+)
+
+
+def test_tool_calls_get_own_inputs_and_no_false_db_dependency(tmp_path):
+    path = tmp_path / "t.yaml"
+    path.write_text(TOOLS_WITH_DB_TEMPLATE)
+    graph = GraphTemplateParser(str(path)).parse()
+    pre, post = graph.nodes["analyst__pre__news"], graph.nodes["analyst__post__extract"]
+    assert pre.inputs == ("user_query",)
+    assert post.inputs[0] == "report"  # processors reading their first input see the LLM output
+    parents = {e.source for e in graph.edges if e.target == pre.id}
+    assert parents == {"user_input"}
+    assert set(graph.nodes["analyst"].inputs) >= {"user_query", "q", "news"}
+
+
+def test_streaming_distinguishes_templates_with_same_name_and_ids():
+    from halo.models import Edge, GraphSpec
+    from halo.streaming import StreamingSession
+
+    def graph(proc):
+        nodes = {"t": Node(id="t", type="processor", engine=None, model=None, inputs=("x",), outputs=("y",),
+                           db_queries=(), raw={"processor": proc})}
+        return GraphSpec(name="unnamed", description="", nodes=nodes, edges=[])
+
+    class Opt:
+        def build_plan(self, g, **_):
+            return g.nodes["t"].raw["processor"]
+
+    class Proc:
+        def run_batch(self, plan, g, contexts):
+            return [{"plan": plan} for _ in contexts]
+
+    session = StreamingSession(Opt(), Proc())
+    session.submit(graph("upper"), {"x": "a"})
+    session.submit(graph("reverse"), {"x": "b"})
+    results = session.flush()
+    assert [results[0]["plan"], results[1]["plan"]] == ["upper", "reverse"]
+    assert session.optimizer_runs == 2
+
+
+def test_streaming_failure_keeps_finished_and_requeues_rest():
+    from halo.models import GraphSpec
+    from halo.streaming import StreamingSession
+
+    def graph(name):
+        return GraphSpec(name=name, description="", nodes={}, edges=[])
+
+    class Opt:
+        def build_plan(self, g, **_):
+            return g.name
+
+    class Proc:
+        runs = []
+
+        def run_batch(self, plan, g, contexts):
+            self.runs.append(plan)
+            if plan == "bad":
+                raise RuntimeError("boom")
+            return [{"plan": plan} for _ in contexts]
+
+    proc = Proc()
+    session = StreamingSession(Opt(), proc)
+    for name in ("ok1", "bad", "ok2"):
+        session.submit(graph(name), {})
+    try:
+        session.flush()
+        raise AssertionError("flush should re-raise")
+    except RuntimeError as exc:
+        assert exc.failed_tickets == [1]
+    results = session.flush()
+    assert sorted(results) == [0, 2] and proc.runs == ["ok1", "bad", "ok2"]  # no segment re-run
+
+
+def test_profiling_coalesced_http_twice_keeps_real_latency():
+    graph = type("G", (), {})()
+    node = _http_node(coalesce=True, sleep_ms=50)
+    graph.nodes = {"fetch": node}
+    prof = profiler.GraphProfiler.__new__(profiler.GraphProfiler)
+    prof._http_executor = HTTPNodeExecutor(http_concurrency=1)
+    first, _ = _REAL_PROFILE_HTTP(prof, graph, [{"ticker": "AAPL"}])
+    second, _ = _REAL_PROFILE_HTTP(prof, graph, [{"ticker": "AAPL"}])
+    assert first["fetch"] > 0 and second["fetch"] > 0
+
+
+def test_cpu_nodes_round_robin_without_cost_estimates(tmp_path):
+    queries = "".join(
+        f'        - {{name: q{i}, sql: "SELECT {i} WHERE :x = :x", parameters: {{x: user_query}}}}\n'
+        for i in range(4)
+    )
+    path = tmp_path / "fan.yaml"
+    path.write_text(
+        "graph:\n"
+        "  name: fan\n"
+        "  nodes:\n"
+        "    - {id: user_input, type: input, outputs: [user_query]}\n"
+        "    - id: llm\n"
+        "      type: inference\n"
+        "      engine: vllm\n"
+        "      model: meta-llama/Llama-3.2-3B-Instruct\n"
+        "      inputs: [user_query]\n"
+        "      outputs: [a]\n"
+        "      db_queries:\n" + queries +
+        "  edges:\n"
+        "    - {from: user_input, to: llm, mapping: {user_query: '{{ user_query }}'}}\n"
+    )
+    graph = GraphTemplateParser(str(path)).parse()
+    plan = GraphOptimizer(num_gpus=1, num_cpu_workers=4, scheduler_mode="dp", plan_mode="baseline").build_plan(
+        graph, sample_contexts=[{"user_query": "q"}], input_query_count=8
+    )
+    cpu = {t.worker_id for t in plan.tasks if plan.workers[t.worker_id].kind == "cpu"}
+    assert len(cpu) == 4

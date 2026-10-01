@@ -53,6 +53,13 @@ def _gpu_result_bridge(
         dst.put(msg)
 
 
+_LIVENESS_POLL_S = 1.0
+
+
+class WorkerDiedError(RuntimeError):
+    """A worker process exited while the batch still had work in flight."""
+
+
 class MultiProcessGraphProcessor:
     """多进程版本的 Graph Processor。
 
@@ -180,7 +187,12 @@ class MultiProcessGraphProcessor:
                 task_queues,
                 result_queue,
                 progress_monitor=progress_monitor,
+                worker_handles=workers,
             )
+        except WorkerDiedError:
+            if self._persistent_workers:
+                self.close()  # do not reuse a pool with a dead worker
+            raise
         finally:
             if progress_monitor:
                 progress_monitor.stop()
@@ -336,9 +348,13 @@ class MultiProcessGraphProcessor:
         result_queue: "queue.SimpleQueue[ResultMessage]",
         *,
         progress_monitor: ProgressMonitor | None = None,
+        worker_handles: Mapping[str, Any] | None = None,
     ) -> None:
         if not contexts:
             return
+        gpu_processes = {
+            wid: handle for wid, handle in (worker_handles or {}).items() if isinstance(handle, mp.Process)
+        }
 
         dependencies, dependents = self._build_dependency_graph(plan)
         # 全局依赖驱动调度
@@ -775,10 +791,14 @@ class MultiProcessGraphProcessor:
 
             try:
                 # Unified in-process queue: CPU threads put directly, a bridge
-                # thread forwards GPU mp.Queue messages here. Block until a
-                # result arrives — no polling timeout.
-                result = result_queue.get()
+                # thread forwards GPU mp.Queue messages here. Wake up periodically
+                # to notice a GPU worker that died without reporting (e.g. killed
+                # by its serving engine after a CUDA error).
+                result = result_queue.get(timeout=_LIVENESS_POLL_S)
             except queue.Empty:
+                dead = {wid: h.exitcode for wid, h in gpu_processes.items() if not h.is_alive()}
+                if dead:
+                    raise WorkerDiedError(f"GPU worker(s) exited without reporting a result: {dead}")
                 continue
             self._record_worker_metrics(result.stats)
             node_id = result.node_id

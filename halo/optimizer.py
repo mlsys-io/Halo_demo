@@ -936,14 +936,15 @@ class GraphOptimizer:
     ) -> Dict[str, Tuple[str, ...]]:
         cpu_worker_ids = sorted(wid for wid, w in workers.items() if w.kind == "cpu")
         # Affinity routing: when at least 2 CPU workers are available and the
-        # graph mixes DB + HTTP nodes, dedicate cpu-1 to HTTP so that an
-        # ``time.sleep`` in HTTP cannot block DB dispatch on cpu-0. Processor /
-        # noop nodes share the DB-affinity worker (cpu-0).
+        # graph mixes DB + HTTP nodes, split the CPU workers into a DB group
+        # (cpu-0, cpu-2, ...) and an HTTP group (cpu-1, cpu-3, ...) so that a
+        # slow HTTP call cannot block DB dispatch. Processor / noop nodes may
+        # run on any CPU worker.
         has_http = any(n.engine == "http" for n in graph.nodes.values())
         has_db = any(n.engine == "db" or n.type == "db_query" for n in graph.nodes.values())
         split_affinity = has_http and has_db and len(cpu_worker_ids) >= 2
-        db_workers = (cpu_worker_ids[0],) if cpu_worker_ids else tuple()
-        http_workers = (cpu_worker_ids[1],) if split_affinity else tuple(cpu_worker_ids)
+        db_workers = tuple(cpu_worker_ids[0::2])
+        http_workers = tuple(cpu_worker_ids[1::2]) if split_affinity else tuple(cpu_worker_ids)
 
         options: Dict[str, Tuple[str, ...]] = {}
         for node_id in node_ids:

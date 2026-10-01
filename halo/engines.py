@@ -6,6 +6,7 @@ import importlib
 import inspect
 import logging
 import os
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Mapping, Protocol, Sequence
 import time
@@ -175,13 +176,21 @@ def _to_sglang_kwargs(
 
 
 def _to_sglang_sampling(options: Mapping[str, Any]) -> Dict[str, Any]:
-    return _to_sglang_kwargs(
+    translated = _to_sglang_kwargs(
         options,
         _SGLANG_SAMPLING_NAMES,
         _sglang_param_names("sglang.srt.sampling.sampling_params", "SamplingParams"),
         what="sampling params",
         drop=_SGLANG_SAMPLING_DROP,
     )
+    # Values whose vLLM conventions differ from SGLang's validation.
+    if translated.get("top_k") == 0:  # vLLM: 0 disables top-k; SGLang uses -1
+        translated["top_k"] = -1
+    penalty = translated.get("repetition_penalty")
+    if isinstance(penalty, (int, float)) and penalty > 2.0:
+        LOGGER.warning("SGLangEngine: repetition_penalty %.2f clipped to SGLang's maximum 2.0", penalty)
+        translated["repetition_penalty"] = 2.0
+    return translated
 
 
 def _to_sglang_engine_args(options: Mapping[str, Any]) -> Dict[str, Any]:
@@ -196,6 +205,16 @@ def _to_sglang_engine_args(options: Mapping[str, Any]) -> Dict[str, Any]:
         _sglang_param_names("sglang.srt.server_args", "ServerArgs"),
         what="engine args",
     )
+
+
+class SGLangSubprocessError(RuntimeError):
+    """An SGLang scheduler/detokenizer subprocess failed (it signalled SIGQUIT)."""
+
+
+def _raise_on_sigquit(signum: int, frame: Any) -> None:
+    # Replaces SGLang's default handler, which SIGKILLs the whole hosting process
+    # tree: raising lets the GPU worker report the failure as a node error.
+    raise SGLangSubprocessError("An SGLang subprocess failed; see its log for the cause.")
 
 
 def _child_processes() -> List[Any]:
@@ -240,6 +259,22 @@ def _wait_for_exit(procs: Sequence[Any], timeout: float = 30.0) -> None:
         )
 
 
+def _kill_and_wait(procs: Sequence[Any]) -> None:
+    """SIGKILL ``procs`` and their descendants, then wait until they have exited."""
+    tree = {proc.pid: proc for proc in procs}
+    for proc in procs:
+        try:
+            tree.update((child.pid, child) for child in proc.children(recursive=True))
+        except Exception:  # already gone
+            pass
+    for proc in tree.values():
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    _wait_for_exit(list(tree.values()))
+
+
 class SGLangEngine:
     """Thin wrapper around SGLang's offline ``sgl.Engine`` (single device by default).
 
@@ -267,16 +302,28 @@ class SGLangEngine:
             kwargs.pop("tensor_parallel_size", None)
             kwargs.pop("tp_size", None)
         engine_args = _to_sglang_engine_args(kwargs)
+        # Like vLLM, cap max_new_tokens at the context length instead of failing the request.
+        engine_args.setdefault("allow_auto_truncate", True)
+        engine_args.setdefault("custom_sigquit_handler", _raise_on_sigquit)
+        if threading.current_thread() is not threading.main_thread():
+            raise RuntimeError(
+                "SGLangEngine must be created on the main thread (SGLang installs a signal handler)."
+            )
 
         known_pids = {proc.pid for proc in _child_processes()}
+        self._engine = None
+        self._procs: List[Any] = []
         try:
             self._engine = sgl.Engine(model_path=model, **engine_args)
         except ImportError as exc:  # e.g. a frontend-only `sglang` without its runtime deps
             raise RuntimeError(
                 "SGLang failed to import its runtime; install `sglang[all]` (see README)."
             ) from exc
-        # Scheduler/detokenizer subprocesses of this engine; shutdown() waits for them to exit.
-        self._procs = [proc for proc in _child_processes() if proc.pid not in known_pids]
+        finally:
+            # Scheduler/detokenizer subprocesses of this engine (also on a failed start).
+            self._procs = [proc for proc in _child_processes() if proc.pid not in known_pids]
+            if self._engine is None:
+                _kill_and_wait(self._procs)
         self._default_sampling = sampling_defaults
 
     def generate(self, prompt: str, *, label: str | None = None, **kwargs: Any) -> str:
@@ -304,24 +351,18 @@ class SGLangEngine:
         return [(output.get("text") or "").strip() for output in outputs]
 
     def shutdown(self) -> None:
-        """Stop SGLang's subprocesses and wait for them to exit, releasing their GPU memory."""
+        """Stop this engine's subprocesses and wait for them to exit, releasing their GPU memory.
+
+        SGLang's own ``Engine.shutdown`` kills every child of the hosting process,
+        which would also hit unrelated processes when the engine lives in the
+        user's main process (Serial / Opwise processors); kill only our own tree.
+        """
         engine, self._engine = self._engine, None
         if engine is None:
             return
-        procs = {proc.pid: proc for proc in self._procs}
-        for proc in self._procs:
-            try:
-                procs.update((child.pid, child) for child in proc.children(recursive=True))
-            except Exception:  # already gone
-                pass
-        self._procs = []
-        try:
-            # SGLang SIGKILLs every child of the hosting process -- in a Halo GPU
-            # worker process those are exactly this engine's subprocesses.
-            engine.shutdown()
-        finally:
-            atexit.unregister(engine.shutdown)  # registered by sgl.Engine; would pin the engine
-            _wait_for_exit(list(procs.values()))
+        procs, self._procs = self._procs, []
+        atexit.unregister(engine.shutdown)  # registered by sgl.Engine; would pin the engine
+        _kill_and_wait(procs)
 
 
 def make_vllm_provider(*, allow_tensor_parallel: bool = False, **engine_kwargs: Any) -> EngineProvider:

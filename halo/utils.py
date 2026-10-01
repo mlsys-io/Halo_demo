@@ -53,3 +53,10 @@ def lookup_path(obj: Any, path: str, *, default: Any = MISSING) -> Any:
             continue
         return default
     return current
+
+
+def as_bool(value: Any) -> bool:
+    """Interpret a YAML flag; quoted strings such as ``"false"`` count as false."""
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)

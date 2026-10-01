@@ -78,13 +78,19 @@ class FakeServerArgs:
     disable_radix_cache: bool = False
     trust_remote_code: bool = False
     random_seed: int | None = None
+    allow_auto_truncate: bool = False
+    custom_sigquit_handler: object = None
+
+
+# Engine args SGLangEngine always sets; left out of ``FakeSGLEngine.kwargs``.
+HALO_ENGINE_DEFAULTS = ("allow_auto_truncate", "custom_sigquit_handler")
 
 
 class FakeSamplingParams:
     """Subset of sglang.srt.sampling.sampling_params.SamplingParams."""
 
     def __init__(self, max_new_tokens=128, stop=None, temperature=1.0, top_p=1.0, top_k=-1,
-                 min_new_tokens=0, n=1, ignore_eos=False, sampling_seed=None):
+                 min_new_tokens=0, n=1, ignore_eos=False, sampling_seed=None, repetition_penalty=1.0):
         pass
 
 
@@ -97,9 +103,11 @@ class FakeSGLEngine:
         if kwargs["model_path"] == "no-runtime":  # frontend-only sglang: lazy runtime import fails
             raise ModuleNotFoundError("No module named 'sgl_kernel'")
         FakeServerArgs(**kwargs)  # unknown engine args -> TypeError, as in SGLang
-        self.kwargs = kwargs
+        self.server_kwargs = kwargs
+        self.kwargs = {k: v for k, v in kwargs.items() if k not in HALO_ENGINE_DEFAULTS}
         self.calls: list[tuple[list[str], dict]] = []
-        self.shutdown_calls = 0
+        self.shutdown_calls = 0  # counted by SGLangEngine.shutdown (see fake_sglang)
+        self.sglang_shutdown_called = False
         self.child: subprocess.Popen | None = None
         if kwargs["model_path"] == "spawns-child":
             self.child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
@@ -114,11 +122,8 @@ class FakeSGLEngine:
         return [{"text": f"  sglang[{self.kwargs['model_path']}]:{p}  ", "meta_info": {}} for p in prompt]
 
     def shutdown(self):
-        # Like SGLang: kill the subprocesses, do not wait for them.
-        self.shutdown_calls += 1
-        if self.child is not None:
-            self.child.kill()
-        _log(f"sglang:shutdown:{self.kwargs['model_path']}")
+        # SGLang's version kills every child of the hosting process; Halo must not call it.
+        self.sglang_shutdown_called = True
 
 
 class FakeVLLMEngine:
@@ -159,6 +164,16 @@ def fake_sglang(monkeypatch):
     FakeVLLMEngine.instances.clear()
     monkeypatch.setattr(engines, "VLLMEngine", FakeVLLMEngine)
     monkeypatch.setenv("HALO_MONITOR_ENABLE", "0")
+
+    original_shutdown = engines.SGLangEngine.shutdown
+
+    def counting_shutdown(self):
+        if self._engine is not None:
+            self._engine.shutdown_calls += 1
+            _log(f"sglang:shutdown:{self._engine.kwargs['model_path']}")
+        original_shutdown(self)
+
+    monkeypatch.setattr(engines.SGLangEngine, "shutdown", counting_shutdown)
     return FakeSGLEngine
 
 
@@ -306,7 +321,7 @@ def test_sglang_shutdown_waits_for_engine_subprocesses(fake_sglang, monkeypatch)
     pid = fake.child.pid
     assert [proc.pid for proc in engine._procs] == [pid]
     engine.shutdown()
-    assert fake.shutdown_calls == 1
+    assert fake.shutdown_calls == 1 and not fake.sglang_shutdown_called
     # Fully exited before shutdown() returned, but not reaped behind its owner's back.
     assert psutil.Process(pid).status() == psutil.STATUS_ZOMBIE
     assert fake.child.wait(timeout=5) == -9
@@ -437,3 +452,26 @@ def test_multiprocess_processor_runs_mixed_template(fake_sglang, tmp_path):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+def test_sglang_shutdown_spares_unrelated_child_processes(fake_sglang):
+    bystander = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        engine = SGLangEngine("spawns-child")
+        engine.shutdown()
+        assert bystander.poll() is None  # SGLang's Engine.shutdown would have killed it
+    finally:
+        bystander.kill()
+        bystander.wait()
+
+
+def test_sglang_engine_sets_safe_defaults_and_maps_vllm_values(fake_sglang):
+    engine = SGLangEngine("m", sampling_params={"top_k": 0, "repetition_penalty": 2.5})
+    fake = fake_sglang.instances[-1]
+    assert fake.server_kwargs["allow_auto_truncate"] is True
+    assert fake.server_kwargs["custom_sigquit_handler"] is engines._raise_on_sigquit
+    with pytest.raises(engines.SGLangSubprocessError):
+        engines._raise_on_sigquit(3, None)
+    assert engine._default_sampling["top_k"] == -1
+    assert engine._default_sampling["repetition_penalty"] == 2.0
+

@@ -1631,9 +1631,8 @@ class DPSolver:
             return self._processor_cost(node)
         total = 0.0
         for query in getattr(node, "db_queries", ()) or ():
-            choices = self.plan_choices.get((node_id, query.name)) or ()
-            if choices:
-                total += min(self._plan_base_cost(choice) for choice in choices)
+            choices = self.plan_choices.get((node_id, query.name)) or (self._fallback_choice,)
+            total += min(self._plan_base_cost(choice) for choice in choices)
         return total
 
     def _cpu_assignments(self, cpu_nodes: Sequence[str]) -> List[tuple[str, str]]:
@@ -1645,12 +1644,15 @@ class DPSolver:
         if not workers:
             return []
         load: Dict[str, float] = {}
+        count: Dict[str, int] = {}
         seq: List[tuple[str, str]] = []
         for node_id in cpu_nodes:
             allowed = self.node_worker_options.get(node_id, workers)
             eligible = tuple(w for w in workers if w in allowed) or workers
-            wid = min(eligible, key=lambda w: (load.get(w, 0.0), eligible.index(w)))
+            # Least estimated load; ties (e.g. no cost estimates) fall back to round-robin.
+            wid = min(eligible, key=lambda w: (load.get(w, 0.0), count.get(w, 0), eligible.index(w)))
             load[wid] = load.get(wid, 0.0) + self._cpu_cost_estimate(node_id)
+            count[wid] = count.get(wid, 0) + 1
             seq.append((wid, node_id))
         return seq
 
