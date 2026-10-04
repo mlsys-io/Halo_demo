@@ -1,8 +1,8 @@
 <div style="text-align: center;">
-    <img src="figs/logo.jpg" alt="示例图片" width="400" height="150">
+    <img src="figs/logo.jpg" alt="Halo logo" width="400" height="150">
     <br>
     <a href="https://arxiv.org/abs/2509.02121" target="_blank">
-    <img src="https://img.shields.io/badge/arXiv-2301.12345-b31b1b.svg" 
+    <img src="https://img.shields.io/badge/arXiv-2509.02121-b31b1b.svg" 
         alt="arXiv" width="100" style="vertical-align:middle;">
     </a>
 </div>
@@ -126,7 +126,7 @@ graph = GraphTemplateParser("templates/example_chain.yaml").parse()
 
 # 2) Optimize: a single-pass DP picks node order, worker placement, and query
 #    order, tracking model/cache reuse. scheduler_mode also accepts
-#    "rr_topo", "model_first", "greedy", "minswitch", "milp", or "auto".
+#    "rr_topo", "random_topo", "greedy", "minswitch", "milp", or "auto".
 optimizer = GraphOptimizer(num_gpus=2, scheduler_mode="dp", plan_mode="default")
 plan = optimizer.build_plan(graph, sample_contexts=[{"user_query": "What is a machine learning system?"}])
 

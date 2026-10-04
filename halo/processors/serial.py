@@ -8,7 +8,7 @@ from ..monitoring import ProgressMonitor, start_progress_monitor, start_system_m
 from .base import BaseGraphProcessor, count_progress_nodes, is_progress_node
 
 class SerialGraphProcessor(BaseGraphProcessor):
-    """串行执行：逐个 context 顺序执行 DAG（无多进程/批处理）。"""
+    """Serial execution: run the DAG context by context (no multiprocessing or batching)."""
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)

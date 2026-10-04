@@ -57,15 +57,15 @@ class WorkerDiedError(RuntimeError):
 
 
 class MultiProcessGraphProcessor:
-    """多进程版本的 Graph Processor。
+    """Multi-process graph processor.
 
-    - 主进程负责：
-        * 维护全局 context
-        * 跟踪依赖完成情况 (dependencies / dependents)
-        * 按 ExecutionPlan.worker_id 将任务派发到各个 worker 进程
-    - 每个 worker 进程负责：
-        * GPU worker 持有各自的 EngineProvider/LLM 引擎（vLLM / SGLang）cache
-        * CPU worker 持有 DB 执行器
+    - The main process:
+        * maintains the global context
+        * tracks dependency completion (dependencies / dependents)
+        * dispatches tasks to worker processes by ExecutionPlan.worker_id
+    - Each worker process:
+        * GPU workers own their EngineProvider/LLM engine (vLLM / SGLang) cache
+        * CPU workers own the DB executor
     """
 
     def __init__(
@@ -144,7 +144,7 @@ class MultiProcessGraphProcessor:
         graph: GraphSpec,
         initial_inputs: MutableMapping[str, Any],
     ) -> Dict[str, Any]:
-        """执行给定的 ExecutionPlan，并返回最终 context。"""
+        """Execute the given ExecutionPlan and return the final context."""
         final_contexts = self.run_batch(plan, graph, [initial_inputs])
         return final_contexts[0] if final_contexts else {}
 
@@ -154,7 +154,7 @@ class MultiProcessGraphProcessor:
         graph: GraphSpec,
         initial_inputs_list: Sequence[MutableMapping[str, Any]],
     ) -> List[Dict[str, Any]]:
-        """批量执行 ExecutionPlan，返回每个 query 的最终 context。"""
+        """Execute the ExecutionPlan for a batch and return each query's final context."""
         if not initial_inputs_list:
             return []
 
@@ -329,7 +329,7 @@ class MultiProcessGraphProcessor:
         self,
         plan: ExecutionPlan,
     ) -> tuple[Dict[str, Set[str]], Dict[str, List[str]]]:
-        """从 ExecutionPlan 构建 dependencies / dependents 映射。"""
+        """Build the dependencies / dependents maps from the ExecutionPlan."""
         dependencies: Dict[str, Set[str]] = {
             t.node_id: set(t.dependencies) for t in plan.tasks
         }
@@ -357,9 +357,9 @@ class MultiProcessGraphProcessor:
         }
 
         dependencies, dependents = self._build_dependency_graph(plan)
-        # 全局依赖驱动调度
+        # Global dependency-driven scheduling
         task_map: Dict[str, ExecutionTask] = {task.node_id: task for task in plan.tasks}
-        # 保留优化器给出的原始顺序，用作同 epoch 的稳定 tie-breaker。
+        # Keep the optimizer's original order as a stable tie-breaker within an epoch.
         plan_order: Dict[str, int] = {task.node_id: idx for idx, task in enumerate(plan.tasks)}
         worker_by_id = plan.workers
         node_worker: Dict[str, Any] = {task.node_id: task.worker_id for task in plan.tasks}
@@ -566,7 +566,7 @@ class MultiProcessGraphProcessor:
                 worker_idle = bool(
                     assigned_worker_id and worker_inflight_counts.get(assigned_worker_id, 0) <= 0
                 )
-                # 鼓励低 epoch 先跑：如果当前节点 epoch 大于已就绪的最小 epoch，且 CPU worker 闲置，则跳过
+                # Favor lower epochs: skip if this node's epoch exceeds the smallest ready epoch while a CPU worker is idle
                 if (
                     min_ready_epoch is not None
                     and task_map[node_id].epoch > min_ready_epoch
@@ -645,7 +645,7 @@ class MultiProcessGraphProcessor:
 
                 context_batch = [slice_context(idx) for idx in batch_indices]
 
-                # GPU worker 模型级串行：同一 GPU 上不同模型需等待在飞批次完成后再切换
+                # Per-GPU model serialization: switching models on a GPU waits for in-flight batches to finish
                 desired_model = (llm_model_key(node) or "") if is_llm_engine(node.engine) else None
                 if worker_ids_seq and all(worker_by_id.get(wid) and worker_by_id[wid].kind == "gpu" for wid in worker_ids_seq):
                     model_conflict = False

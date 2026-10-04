@@ -133,7 +133,7 @@ class ExecutionTask:
 
 @dataclass(frozen=True, slots=True)
 class ExecutionPlan:
-    """Result of the optimizer. 执行计划包含 worker 描述、任务顺序以及查询计划选择。"""
+    """Result of the optimizer: worker descriptions, task order, and query-plan choices."""
 
     workers: Dict[str, Worker]
     tasks: Sequence[ExecutionTask]

@@ -20,7 +20,7 @@ _RESET = "\033[0m"
 
 @dataclass(slots=True)
 class TaskMessage:
-    """从主进程发送给 worker 的消息。"""
+    """Message sent from the main process to a worker."""
 
     node_id: str
     node: Node | None
@@ -32,7 +32,7 @@ class TaskMessage:
 
 @dataclass(slots=True)
 class ResultMessage:
-    """worker 返回给主进程的结果消息。"""
+    """Result message returned from a worker to the main process."""
 
     node_id: str
     worker_id: str | None = None
@@ -48,7 +48,7 @@ def engine_config(epoch: int, node: Node) -> Dict[str, Any]:
     return {"epoch": epoch, "model": node.model or "", "engine": node.engine}
 
 def configure_device_env(device: str) -> None:
-    """根据 Worker.device 配置环境（例如 CUDA_VISIBLE_DEVICES）。"""
+    """Configure the environment from Worker.device (e.g., CUDA_VISIBLE_DEVICES)."""
     if device.startswith("cuda:"):
         try:
             idx = int(device.split(":")[1])
@@ -65,9 +65,9 @@ def worker_process_loop(
     engine_kwargs: Dict[str, Any] | None = None,
     executor_kwargs: Dict[str, Any] | None = None,
 ) -> None:
-    """Worker 进程主循环。
+    """Main loop of a worker process.
 
-    每个 GPU worker 进程拥有自己的 EngineProvider 和 LLM 引擎（vLLM / SGLang）cache。
+    Each GPU worker process owns its EngineProvider and LLM engine (vLLM / SGLang) cache.
     """
     engine_kwargs = dict(engine_kwargs or {})
     executor_kwargs = dict(executor_kwargs or {})
@@ -226,7 +226,7 @@ def cpu_worker_loop(
     db_executor_factory: Callable[[], DatabaseExecutor] | None = None,
     executor_kwargs: Dict[str, Any] | None = None,
 ) -> None:
-    """CPU worker 线程主循环，仅处理 DB/HTTP/非 LLM 节点。"""
+    """Main loop of a CPU worker thread; handles only DB/HTTP/non-LLM nodes."""
     db_executor_factory = db_executor_factory or DefaultDatabaseExecutor
     executor_kwargs = dict(executor_kwargs or {})
     http_concurrency = executor_kwargs.pop("http_concurrency", None)

@@ -13,7 +13,7 @@ from .utils import MISSING, PLACEHOLDER_PATTERN, lookup_path
 LOGGER = logging.getLogger(__name__)
 
 
-# 默认 EXPLAIN 方案：覆盖常见的扫描/Join 偏好，便于 profile。
+# Default EXPLAIN variants: cover common scan/join preferences for profiling.
 DEFAULT_QUERY_PLANS: Sequence[QueryPlanOption] = (
     QueryPlanOption(id="default", description="Postgres default"),
     QueryPlanOption(
@@ -93,7 +93,7 @@ class QueryPlanEvaluator:
         *,
         default_plan_only: bool = False,
     ) -> Dict[tuple[str, str], List[QueryPlanChoice]]:
-        """遍历 DAG 中所有 DBQuery，并收集候选执行计划。"""
+        """Walk every DBQuery in the DAG and collect candidate execution plans."""
         LOGGER.debug("Collecting EXPLAIN plans for graph %s", graph.name)
         evaluations: Dict[tuple[str, str], List[QueryPlanChoice]] = {}
         for node in graph.nodes.values():
@@ -162,9 +162,9 @@ class QueryPlanEvaluator:
         *,
         node_id: str,
     ) -> Dict[str, Any] | None:
-        """优先使用真实上下文；不足时自动填充 placeholder。"""
+        """Prefer real contexts; fill in placeholders when there are not enough."""
         placeholders = self._collect_placeholder_types(query)
-        # 先尝试用户提供的上下文
+        # Try user-provided contexts first
         for ctx in contexts:
             augmented = self._augment_context(ctx, placeholders)
             try:
@@ -173,7 +173,7 @@ class QueryPlanEvaluator:
                 continue
             if not missing:
                 return params
-        # 不足则用占位构造
+        # Otherwise construct placeholders
         try:
             fallback_ctx = self._build_placeholder_context(placeholders)
             params, missing = resolve_query_parameters(query, fallback_ctx, node_id=node_id)
@@ -205,7 +205,7 @@ class QueryPlanEvaluator:
         return None, None
 
     def _normalize_cost(self, raw_cost: float | None) -> float | None:
-        """通过 log 缩放，使得 explain 的 cost 与执行 cost 处于同一量级。"""
+        """Log-scale EXPLAIN costs so they match execution costs in magnitude."""
         if raw_cost is None:
             return None
         if raw_cost <= 0:
@@ -300,7 +300,7 @@ class QueryPlanEvaluator:
         return "sample"
 
     def _plan_candidates(self, query: DBQuery, default_only: bool = False) -> Sequence[QueryPlanOption]:
-        """确保始终有可用的计划候选集。"""
+        """Ensure a candidate plan set is always available."""
         if default_only:
             if query.plans:
                 for plan in query.plans:
@@ -314,7 +314,7 @@ class QueryPlanEvaluator:
 
 
 def plan_evaluator_from_env(env: Mapping[str, str] | None = None) -> QueryPlanEvaluator:
-    """基于环境变量构造 Postgres plan evaluator。"""
+    """Build a Postgres plan evaluator from environment variables."""
     env_map = env or os.environ
     dsn = env_map.get("HALO_PLAN_PG_DSN") or env_map.get("HALO_PG_DSN")
     connect_kwargs = _plan_db_connect_kwargs(env_map)

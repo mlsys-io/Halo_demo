@@ -32,7 +32,7 @@ from .profiler import GraphProfiler, GraphProfile
 
 
 def _detect_gpu_count() -> int:
-    """根据环境变量或 torch 自动侦测 GPU 数量。"""
+    """Detect the GPU count from environment variables or torch."""
     env_override = os.getenv("HALO_NUM_GPUS")
     if env_override is not None:
         try:
@@ -55,7 +55,7 @@ class WorkerPoolConfig:
     num_cpus: int = 1
 
     def build_workers(self) -> Dict[str, Worker]:
-        """构造 GPU + CPU worker，CPU/input 节点在主进程内处理。"""
+        """Build GPU and CPU workers; CPU/input nodes are handled in the main process."""
         workers: Dict[str, Worker] = {}
         for idx in range(max(0, self.num_cpus)):
             worker_id = f"cpu-{idx}"
@@ -77,7 +77,7 @@ class WorkerPoolConfig:
 
 
 class GraphOptimizer:
-    """单阶段 DP：同时优化节点顺序、worker 绑定和 query 顺序。"""
+    """Single-pass DP: jointly optimizes node order, worker binding, and query order."""
 
     def __init__(
         self,
@@ -192,8 +192,8 @@ class GraphOptimizer:
         self._db_input_sec = _env_float("HALO_COST_DB_INPUT_SEC", 0.05)
         self._raw_cost_scale = 3.65e-6
         self._epoch_penalty_weight = float(epoch_penalty_weight)
-        # cost model 中“输入 query 数量”（一个 batch/run 内的 user queries 个数）。
-        # 默认按 1；可在 build_plan 时通过 input_query_count 覆盖（runner 里通常传 --sample-count）。
+        # Number of input queries in the cost model (user queries in one batch/run).
+        # Defaults to 1; build_plan can override it via input_query_count (runners usually pass --sample-count).
         self._input_query_count = 1
         self._validate_modes()
 
@@ -209,7 +209,7 @@ class GraphOptimizer:
         allowed_plan = {"profiled", "baseline", "default"}
         if self.plan_mode not in allowed_plan:
             raise ValueError(f"Unsupported plan_mode '{self.plan_mode}'. Expected one of {allowed_plan}.")
-        allowed_scheduler = {"auto", "dp", "rr_topo", "random_topo", "model_first", "greedy", "minswitch", "milp", "opwise"}
+        allowed_scheduler = {"auto", "dp", "rr_topo", "random_topo", "greedy", "minswitch", "milp", "opwise"}
         if self.scheduler_mode not in allowed_scheduler:
             raise ValueError(
                 f"Unsupported scheduler_mode '{self.scheduler_mode}'. Expected one of {allowed_scheduler}."
@@ -235,9 +235,9 @@ class GraphOptimizer:
         self._http_profile_samples = dict(profile.http_samples)
         self._processor_profile_latency = dict(profile.processor_latencies_s)
 
-        # 规划阶段的 cost 需要一个“输入 query 数量”标尺：
-        # - runner remember: --sample-count 是本次 run 处理的 query 数量（建议用它）
-        # - 若不提供，则退化用 sample_contexts 数量（plan profiling 的 sample 数）
+        # Planning-time costs need a scale for the number of input queries:
+        # - runners pass --sample-count, the number of queries processed in this run (preferred)
+        # - otherwise fall back to the number of sample_contexts (plan-profiling samples)
         inferred = len(sample_contexts) if sample_contexts else 1
         if input_query_count is None:
             self._input_query_count = max(1, int(inferred))
@@ -333,9 +333,9 @@ class GraphOptimizer:
         gpu_worker_ids = tuple(sorted([wid for wid, w in workers.items() if w.kind == "gpu"]))
         cpu_worker_ids = tuple(sorted([wid for wid, w in workers.items() if w.kind != "gpu"]))
 
-        # 动态规划调度器
+        # Dynamic-programming scheduler
         schedule_start = time.perf_counter()
-        # 初始化 worker 状态（cache/model 窗口）
+        # Initialize worker states (cache/model window)
         initial_worker_states = tuple(
             WorkerState(
                 worker_idx=idx,
@@ -621,7 +621,7 @@ class GraphOptimizer:
         plan_eval_duration: float,
         node_worker_options: Mapping[str, Sequence[str]],
     ) -> ExecutionPlan:
-        """One logical node per epoch; LLM 节点以数据并行方式同时跑在所有 GPU worker 上。"""
+        """One logical node per epoch; LLM nodes run data-parallel on all GPU workers at once."""
         schedule_start = time.perf_counter()
         selected_plans = self._select_query_plan_defaults(plan_choices)
 
@@ -631,7 +631,7 @@ class GraphOptimizer:
             raise RuntimeError("Data-parallel scheduler requires at least one CPU worker for DB nodes.")
 
         order = list(schedulable_ids)
-        # 简单拓扑排序，若失败则使用原顺序。
+        # Simple topological sort; fall back to the original order on failure.
         try:
             indeg = {nid: 0 for nid in order}
             for nid in order:
@@ -698,11 +698,11 @@ class GraphOptimizer:
         return self._apply_post_refinements(plan, graph)
 
     def _exec_cost(self, node: Node, _worker: Worker) -> float:
-        """执行成本（不含模型切换）。
+        """Execution cost (excluding model switching).
 
-        - LLM (vLLM/SGLang): 仅依赖 model size + 输入 query 数量（通常等于 runner 的 --sample-count）
-        - DB: 仅依赖输入 query 数量（estimate cost 由 query plan choice 单独提供）
-        - HTTP: 使用 profiler 结果（或 fallback 到配置的 sleep/latency）
+        - LLM (vLLM/SGLang): depends only on model size and the input query count (usually the runner's --sample-count)
+        - DB: depends only on the input query count (the estimated cost comes from the query plan choice)
+        - HTTP: uses profiler results (or falls back to the configured sleep/latency)
         """
         if is_llm_engine(node.engine):
             size_b = self._model_size_b(node)
@@ -713,7 +713,7 @@ class GraphOptimizer:
         return self._db_input_sec * max(1, int(getattr(self, "_input_query_count", 1)))
 
     def _greedy_score(self, node: Node, worker: Worker, load: int, last_model: str | None) -> float:
-        """Greedy scheduler综合分：执行成本 + 切换成本 + 负载成本。"""
+        """Greedy scheduler score: execution cost + switch cost + load cost."""
         exec_cost = self._exec_cost(node, worker)
         switch_cost = self._model_init_cost(node, last_model)
         load_cost = 2.0 * max(0, load)
@@ -857,7 +857,7 @@ class GraphOptimizer:
         raw = choice.raw_cost if choice.raw_cost is not None else float("inf")
         return (float(cost), float(raw), choice.plan_id)
 
-    # 基于 footprint 的粗略 cache 折扣
+    # Coarse footprint-based cache discount
     def _cache_multiplier(self, window: Sequence[QuerySignature], choice: QueryPlanChoice) -> float:
         base_fp = choice.footprints or {}
         if not base_fp or not window:
@@ -872,7 +872,7 @@ class GraphOptimizer:
             return 1.0
         return max(0.5, 1.0 - 0.01 * overlap)
 
-    # 模型初始化成本（仅 LLM 节点：vLLM / SGLang）；last_model 为 llm_model_key
+    # Model initialization cost (LLM nodes only: vLLM / SGLang); last_model is an llm_model_key
     def _model_init_cost(self, node: Node, last_model: str | None) -> float:
         if not is_llm_engine(node.engine):
             return 0.0
@@ -884,7 +884,7 @@ class GraphOptimizer:
             return 0.0
         return self._model_init_sec_per_b * size_b
 
-    # 父子节点同 worker 时的 cache 利好
+    # Cache benefit when parent and child run on the same worker
     def _llm_cache_bonus(self, node: Node, last_node: str | None, parents: Sequence[str]) -> float:
         if not parents or not last_node:
             return 1.0
@@ -893,7 +893,7 @@ class GraphOptimizer:
         return 1.0
 
     def _epoch_penalty(self, epoch: int) -> float:
-        """随 epoch 轻微增长的惩罚，用于鼓励早完成。"""
+        """Penalty that grows slightly with the epoch to encourage early completion."""
         return self._epoch_penalty_weight * (1.0 + 0.1 * max(0, epoch))
 
     def _schedulable_node_ids(self, graph: GraphSpec) -> Tuple[str, ...]:

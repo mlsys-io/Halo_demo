@@ -39,7 +39,7 @@ def _read_int_env_or(default: int, name: str) -> int:
         return int(default)
 
 
-# 单个 DB query 的签名，用于 cache multiplier
+# Signature of a single DB query, used for the cache multiplier
 @dataclass(frozen=True, slots=True)
 class QuerySignature:
     node_id: str
@@ -48,9 +48,9 @@ class QuerySignature:
     footprints: Tuple[Tuple[str, int], ...] = tuple()
 
 
-# worker 的局部状态：
-#   - GPU worker: 维护 last_model / last_node
-#   - CPU worker: 仅用于状态去重
+# Local worker state:
+#   - GPU worker: tracks last_model / last_node
+#   - CPU worker: used only for state deduplication
 @dataclass(frozen=True, slots=True)
 class WorkerState:
     worker_idx: int
@@ -59,18 +59,18 @@ class WorkerState:
 
 
 class DPSolver:
-    """DP 调度器：只优化 GPU 侧批次与 worker 映射，CPU 节点按 GPU 规划结果自动填充。
+    """DP scheduler: optimizes GPU-side batches and worker mapping; CPU nodes are filled in from the GPU plan.
 
-    每个 epoch：
-      1. GPU 侧：从 ready 的 LLM 节点中选一批（可行子图），枚举 GPU worker 映射，
-         计算 LLM cost（exec_cost * llm_cache_bonus + model_init）。
-      2. CPU 侧：根据 GPU 规划结果，自动补齐本 epoch 内可执行且必要的 CPU 节点（无 cost、无容量上限）。
-      3. cpu load cost = 所选 GPU 节点的 DB queries 依次累加的 cost
-         （EXPLAIN raw_cost/cost 经 _raw_cost_scale * cache_multiplier），
-         以及 CPU 节点中的 HTTP sleep 代价。
+    Each epoch:
+      1. GPU side: pick a batch of ready LLM nodes (a feasible subgraph), enumerate GPU worker mappings,
+            and compute the LLM cost (exec_cost * llm_cache_bonus + model_init).
+      2. CPU side: from the GPU plan, add the CPU nodes this epoch needs and can run (no cost, no capacity limit).
+      3. cpu load cost = the cumulative cost of the selected GPU nodes' DB queries
+            (EXPLAIN raw_cost/cost scaled by _raw_cost_scale * cache_multiplier),
+            plus the HTTP sleep cost of CPU nodes.
       4. Total cost per epoch = global_epoch_penalty + gpu_cost
-         + cpu_load_weight(epoch) * cpu_load_cost (cpu_load_cost 已包含顺序影响).
-      5. 选中 GPU 节点的子图拓扑深度越深，epoch cost 额外加深度惩罚。
+            + cpu_load_weight(epoch) * cpu_load_cost (cpu_load_cost already reflects ordering).
+      5. The deeper the topological depth of the selected GPU subgraph, the larger the extra depth penalty.
     """
 
     def __init__(
@@ -206,17 +206,17 @@ class DPSolver:
                 wid for wid in worker_ids if workers[wid].kind != "gpu"
             )
         if not self.cpu_worker_ids:
-            # 没有显式 CPU worker 时兜底使用全体 worker。
+            # Without explicit CPU workers, fall back to all workers.
             self.cpu_worker_ids = worker_ids
 
-        # 记录 CPU 节点的拓扑顺序，便于自动批量填充。
+        # Record the topological order of CPU nodes for automatic batch filling.
         try:
             topo = topological_order(self.dependencies, self.node_ids)
         except Exception:
             topo = list(self.node_ids)
         self._db_topo_order = tuple(nid for nid in topo if not self._is_gpu_node(nid))
 
-        # 不再喂给任何 LLM 节点的 CPU 节点（如 post-LLM 工具调用）：父节点完成后即可调度。
+        # CPU nodes that feed no LLM node (e.g., post-LLM tool calls) can be scheduled once their parents finish.
         children: Dict[str, List[str]] = {nid: [] for nid in self.node_ids}
         for nid in self.node_ids:
             for parent in self.dependencies.get(nid, ()):
@@ -236,11 +236,11 @@ class DPSolver:
         self.worker_index = {wid: idx for idx, wid in enumerate(worker_ids)}
         self._worker_id_by_idx = tuple(worker_ids)
 
-        # EXPLAIN raw_cost 缩放因子，沿用原逻辑
+        # Scaling factor for EXPLAIN raw_cost, kept from the original logic
         optimizer = getattr(exec_cost_fn, "__self__", None)
         self._raw_cost_scale = getattr(optimizer, "_raw_cost_scale", 3.65e-6)
 
-        # fallback plan（某些 query 没有 plan_choices 时使用）
+        # Fallback plan (used when a query has no plan_choices)
         self._fallback_choice = QueryPlanChoice(
             plan_id="default",
             description="fallback",
@@ -254,7 +254,7 @@ class DPSolver:
         # env var is honored via DPSolverConfig.from_env). It is exposed via
         # the ``_gpu_depth_cost_weight`` property below for back-compat.
 
-        # id 压缩：将 node/model/query/plan/footprint key 统一映射为 int，减少哈希开销
+        # Id compression: map node/model/query/plan/footprint keys to ints to reduce hashing cost
         self._none_id = -1
         self._node_id_to_int = dict(self.node_index)
         self._node_int_to_id = tuple(self.node_ids)
@@ -295,7 +295,7 @@ class DPSolver:
         self._id_to_signature: List[QuerySignature] = []
         self._node_min_cost: Dict[str, float] = {}
 
-        # cache: (node_id_int, enter_window) -> 所有 query plan 组合
+        # cache: (node_id_int, enter_window) -> all query-plan combinations
         self._query_plan_cache: Dict[
             tuple[int, Tuple[int, ...]],
             Tuple[
@@ -427,7 +427,7 @@ class DPSolver:
     def _prefer_rust(self) -> bool:
         return self.config.prefer_rust
 
-    # === 对外接口 ===
+    # === Public interface ===
 
     def solve(
         self,
@@ -437,7 +437,7 @@ class DPSolver:
         List[tuple[int, str, str]],
         Dict[tuple[str, str], QueryPlanChoice],
     ]:
-        """返回:
+        """Returns:
         - best_cost: float
         - schedule: List[(epoch, worker_id, node_id)]
         - best_plans: {(node_id, query_name) -> QueryPlanChoice}
@@ -608,7 +608,7 @@ class DPSolver:
             best_plans[(node_id, query_name)] = choice
         return best_cost, schedule, best_plans
 
-    # === DP 主过程：状态不含 epoch，epoch 深度通过递归隐式体现 ===
+    # === Main DP: the state excludes the epoch; epoch depth is implicit in the recursion ===
 
     def _solve(
         self,
@@ -675,7 +675,7 @@ class DPSolver:
             cpu_nodes = self._auto_cpu_batch(done_mask, gpu_nodes)
             cpu_nodes = self._order_cpu_nodes_by_parent_depth(cpu_nodes, gpu_depths)
             if not gpu_nodes and not cpu_nodes:
-                continue  # 至少要选一个节点
+                continue  # select at least one node
 
             combined = set(gpu_nodes) | set(cpu_nodes)
             if not self._batch_feasible(combined, done_mask):
@@ -751,7 +751,7 @@ class DPSolver:
                             )
                         self._global_best_cost = min(self._global_best_cost, total_cost)
                         best_cost = total_cost
-                        # 当前 epoch 记为 0，子 schedule 的 epoch 全部 +1
+                        # The current epoch is 0; shift all child-schedule epochs by +1
                         this_epoch_sched = [(0, wid, nid) for (wid, nid) in g_assign]
                         this_epoch_sched += [(0, wid, nid) for (wid, nid) in cpu_assign]
                         shifted_sub_sched = [
@@ -759,13 +759,13 @@ class DPSolver:
                         ]
                         best_schedule_rel = this_epoch_sched + shifted_sub_sched
 
-                        # 合并 plan/order：DB node 只执行一次，直接覆盖即可
+                        # Merge plan/order: a DB node runs only once, so overwrite directly
                         best_plans = dict(sub_plans)
                         best_plans.update(batch_plans)
 
         if best_cost == float("inf"):
             if allow_relax and self.enable_batch_shape_pruning:
-                # 若剪枝过于激进导致无解，回退到未剪枝（保留对称消除）再尝试一次。
+                # If pruning is too aggressive and finds no plan, retry once without it (keeping symmetry elimination).
                 print("DP relaxation: retrying without batch shape pruning (symmetry preserved)...")
                 orig_batch_prune = self.enable_batch_shape_pruning
                 self.enable_batch_shape_pruning = False
@@ -798,7 +798,7 @@ class DPSolver:
         self._memo[key] = (best_cost, canon_schedule, best_plans)
         return best_cost, best_schedule_rel, best_plans
 
-    # === 简单下界（用于 branch-and-bound 剪枝） ===
+    # === Simple lower bound (for branch-and-bound pruning) ===
 
     def _lower_bound_remaining(self, done_mask: int, epoch_idx: int) -> float:
         """Admissible lower bound on remaining cost from ``done_mask``.
@@ -908,14 +908,14 @@ class DPSolver:
         return counts
 
     def _precompute_node_min_cost(self) -> Dict[str, float]:
-        """预估每个节点的最小单机 cost（GPU 节点含 cpu load cost 下界）。"""
+        """Estimate each node's minimum single-worker cost (GPU nodes include a lower bound on cpu load cost)."""
         res: Dict[str, float] = {}
         for node_id in self.node_ids:
             node = self.graph.nodes[node_id]
             if not self._is_gpu_node(node_id):
                 res[node_id] = 0.0
                 continue
-            # 基础 exec cost（按最小 worker capacity 假设）
+            # Base exec cost (assuming the minimum worker capacity)
             min_worker_cost = float("inf")
             allowed_workers = self.node_worker_options.get(node_id, self.worker_ids)
             for wid in allowed_workers:
@@ -927,7 +927,7 @@ class DPSolver:
                 min_worker_cost = min(min_worker_cost, cost)
             if min_worker_cost == float("inf"):
                 min_worker_cost = 0.0
-            # 最便宜的 plan cost（忽略 cache multiplier）
+            # Cheapest plan cost (ignoring the cache multiplier)
             min_plan_cost = self._min_plan_cost(node)
             if self.disable_cpu_load_cost or self.cpu_cost_mode == "naive":
                 min_plan_cost = 0.0
@@ -936,7 +936,7 @@ class DPSolver:
             res[node_id] = min_worker_cost + min_plan_cost
         return res
 
-    # === assignment -> cost & state 更新（GPU cost + cpu load cost 分开算） ===
+    # === assignment -> cost & state update (GPU cost and cpu load cost computed separately) ===
 
     def _assignment_outcomes(
         self,
@@ -952,12 +952,12 @@ class DPSolver:
             Dict[tuple[str, str], QueryPlanChoice],
         ]
     ]:
-        """给定一组 (worker_id, node_id)，枚举:
-          - GPU cost（LLM makespan）
-          - GPU cost sum（LLM 总时长）
-          - cpu load cost（GPU 节点 DB queries 累加 + CPU 节点 HTTP sleep）
-          - 更新后的 worker_states
-          - 本 batch 内的 plan 选择
+        """Given a set of (worker_id, node_id), enumerate:
+          - GPU cost (LLM makespan)
+          - GPU cost sum (total LLM time)
+          - cpu load cost (DB queries of GPU nodes + HTTP sleep of CPU nodes)
+          - updated worker_states
+          - plan choices within this batch
         """
 
         cache_key = (tuple(assign), worker_states, tuple(cpu_nodes))
@@ -1047,7 +1047,7 @@ class DPSolver:
         self._assignment_outcomes_cache[cache_key] = results_tuple
         yield from results_tuple
 
-    # === 单个节点在某个 worker 上的所有执行方式（LLM or DB） ===
+    # === All execution options of a node on a worker (LLM or DB) ===
 
     def _execute_node(
         self,
@@ -1071,7 +1071,7 @@ class DPSolver:
         last_model = self._model_from_id(state.last_model_id)
         last_node = self._node_from_id(state.last_node_id)
 
-        # LLM / DB 都使用 exec_cost_fn；DB 的 estimate cost 由 query plan 单独提供。
+        # LLM and DB both use exec_cost_fn; the DB estimated cost comes from the query plan.
         exec_cost = self._exec_cost_cached(node_id, worker_id)
         model_cost = self._model_init_cost_cached(node_id, state.last_model_id)
         bonus_multiplier = self._llm_bonus_cached(node_id, state.last_node_id, parents)
@@ -1079,7 +1079,7 @@ class DPSolver:
             bonus_multiplier = 1.0
 
         if self._is_gpu_node(node_id):
-            # LLM 节点：LLM cost 与 cpu load cost 分开累计
+            # LLM nodes: accumulate LLM cost and cpu load cost separately
             base_cost = exec_cost * bonus_multiplier + model_cost
             queries = getattr(node, "db_queries", []) or []
             if not queries:
@@ -1102,7 +1102,7 @@ class DPSolver:
                 yield base_cost, query_cost, new_state, plan_map, exit_window
             return
 
-        # 非 GPU 节点：不计 cost、不更新 window（由 CPU 自动填充）
+        # Non-GPU nodes: no cost and no window update (filled in automatically on CPU)
         new_state = WorkerState(
             worker_idx=state.worker_idx,
             last_model_id=state.last_model_id,
@@ -1110,7 +1110,7 @@ class DPSolver:
         )
         yield 0.0, 0.0, new_state, {}, enter_window
 
-    # === DB queries：遍历 plan 组合（当前假设单 query 节点），window 仅在 epoch 内生效 ===
+    # === DB queries: iterate over plan combinations (currently one query per node); the window is valid only within an epoch ===
 
     def _query_plan_options(
         self,
@@ -1126,10 +1126,10 @@ class DPSolver:
 
         queries = list(getattr(node, "db_queries", []) or [])
         if not queries:
-            # 没有 DB query，则 query cost 为 0，window 不变
+            # No DB query: query cost is 0 and the window is unchanged
             self._query_plan_cache[cache_key] = ((0.0, enter_window, tuple()),)
             return self._query_plan_cache[cache_key]
-        # 现在每个 DB node 只有一个 query；若后续有多个 query，则按声明顺序累乘 plan 组合，不再枚举顺序。
+        # Each DB node currently has one query; with more, plan combinations multiply in declaration order without enumerating orders.
         outcomes: List[
             Tuple[float, Tuple[int, ...], Tuple[Tuple[str, QueryPlanChoice], ...]]
         ] = [(0.0, enter_window, tuple())]
@@ -1186,7 +1186,7 @@ class DPSolver:
         return new_window
 
     def _batch_gpu_depths(self, gpu_nodes: Sequence[str]) -> Dict[str, int]:
-        """计算当前 epoch 选中 GPU 子图内的拓扑深度（根=0）。"""
+        """Compute the topological depth (root = 0) within the GPU subgraph selected this epoch."""
         if not gpu_nodes:
             return {}
         selected_list = list(gpu_nodes)
@@ -1217,7 +1217,7 @@ class DPSolver:
     def _batch_gpu_depth_penalty(
         self, gpu_nodes: Sequence[str], gpu_depths: Mapping[str, int] | None = None
     ) -> float:
-        """基于当前 epoch 选中的 GPU 子图深度计算惩罚。"""
+        """Compute the penalty from the depth of the GPU subgraph selected this epoch."""
         if self._gpu_depth_cost_weight <= 0 or not gpu_nodes:
             return 0.0
         depths = gpu_depths if gpu_depths is not None else self._batch_gpu_depths(gpu_nodes)
@@ -1229,7 +1229,7 @@ class DPSolver:
         cpu_nodes: Sequence[str],
         enter_window: Tuple[int, ...],
     ) -> Tuple[float, Dict[tuple[str, str], QueryPlanChoice]]:
-        """按既定 CPU 顺序累计 load cost（DB plan + HTTP sleep + processor 实测延迟），window 仅在 epoch 内有效。"""
+        """Accumulate load cost in the fixed CPU order (DB plan + HTTP sleep + measured processor latency); the window is valid only within an epoch."""
         if not cpu_nodes:
             return 0.0, {}
         window = enter_window
@@ -1284,7 +1284,7 @@ class DPSolver:
 
         return sorted(cpu_nodes, key=key)
 
-    # === id 映射 & window/signature 辅助 ===
+    # === Id mapping & window/signature helpers ===
 
     def _model_to_id(self, model: str | None, fallback: int | None = None) -> int:
         if model is None:
@@ -1379,7 +1379,7 @@ class DPSolver:
         last_node = self._node_from_id(last_node_id)
         return float(self.llm_cache_bonus_fn(node, last_node, parents))
 
-    # === worker 对称性消除 ===
+    # === Worker symmetry elimination ===
 
     def _canonical_worker_states(
         self,
@@ -1424,7 +1424,7 @@ class DPSolver:
         assignments: List[List[tuple[str, str]]],
         worker_states: Tuple[WorkerState, ...],
     ) -> List[List[tuple[str, str]]]:
-        """消除同构 worker 间的对称映射，减少重复 assignment。"""
+        """Eliminate symmetric mappings among isomorphic workers to reduce duplicate assignments."""
         seen: Set[Tuple] = set()
         uniq: List[List[tuple[str, str]]] = []
         for assign in assignments:
@@ -1449,10 +1449,10 @@ class DPSolver:
         items.sort(key=lambda x: x[0])
         return tuple(items)
 
-    # === GPU 批次枚举 ===
+    # === GPU batch enumeration ===
 
     def _enumerate_gpu_batches(self, done_mask: int) -> List[List[str]]:
-        """枚举当前 epoch GPU 侧的可行子图（受 GPU 数量限制，可为空）。"""
+        """Enumerate feasible GPU-side subgraphs for this epoch (bounded by the GPU count; may be empty)."""
         max_gpu = max(1, len(self.gpu_worker_ids))
         pending = [
             node_id
@@ -1462,7 +1462,7 @@ class DPSolver:
         if not pending:
             return [[]]
 
-        # 先做 GPU 子图的拓扑排序，保证父节点在前，枚举时只生成依赖闭包。
+        # Topologically sort the GPU subgraph first so parents come first and enumeration yields only dependency closures.
         pending_list = list(pending)
         pending_set = set(pending_list)
         in_deg = {nid: 0 for nid in pending_list}
@@ -1481,7 +1481,7 @@ class DPSolver:
                     if in_deg[child] == 0:
                         queue.append(child)
         if len(topo) != len(pending_set):
-            # 若有环或异常依赖，退化为原顺序以避免崩溃。
+            # On cycles or bad dependencies, fall back to the original order to avoid crashing.
             topo = pending_list
 
         target = min(max_gpu, len(pending))
@@ -1500,10 +1500,10 @@ class DPSolver:
                     results.append(list(selected))
                 return
 
-            # 不选当前节点
+            # Skip the current node
             dfs(idx + 1, selected, selected_mask)
 
-            # 尝试选择当前节点（前置依赖必须已完成或已被选中）
+            # Try selecting the current node (its predecessors must be done or already selected)
             if len(selected) >= max_r:
                 return
             node_id = topo[idx]
@@ -1523,7 +1523,7 @@ class DPSolver:
         return results
 
     def _auto_cpu_batch(self, done_mask: int, gpu_nodes: Sequence[str]) -> List[str]:
-        """在不考虑容量/成本的前提下，自动填充当前 epoch 必要的 CPU 节点。"""
+        """Fill in the CPU nodes this epoch needs, ignoring capacity and cost."""
         if not self._db_node_ids:
             return []
         batch_mask = done_mask
@@ -1597,7 +1597,7 @@ class DPSolver:
         return total
 
     def _cpu_cost_estimate(self, node_id: str) -> float:
-        """估计单个 CPU 节点的代价（HTTP/processor 用 profiled 延迟，DB 用各 query 最便宜计划之和）。"""
+        """Estimate a CPU node's cost (profiled latency for HTTP/processor; sum of each query's cheapest plan for DB)."""
         cost = self._cpu_cost_cache.get(node_id)
         if cost is None:
             node = self.graph.nodes[node_id]
@@ -1608,8 +1608,8 @@ class DPSolver:
         return cost
 
     def _cpu_assignments(self, cpu_nodes: Sequence[str]) -> List[tuple[str, str]]:
-        """CPU 节点映射到其可用 worker（按资源类别隔离，见 node_worker_options），
-        在可用 worker 之间按估计负载均衡。"""
+        """Map CPU nodes to their allowed workers (isolated by resource class, see node_worker_options),
+        balancing estimated load across those workers."""
         if not cpu_nodes:
             return []
         workers = tuple(self.cpu_worker_ids or self.worker_ids)
@@ -1637,12 +1637,12 @@ class DPSolver:
             return 0.0
         return float(sum(self._cpu_dep_counts.get(node_id, 0) for node_id in gpu_nodes))
 
-    # === worker assignment（GPU） ===
+    # === Worker assignment (GPU) ===
     def _gpu_assignments(
         self,
         gpu_nodes: Sequence[str],
     ) -> Iterable[List[tuple[str, str]]]:
-        """GPU 节点到 GPU worker 的所有映射（每个 worker 至多一个 LLM node）。"""
+        """All mappings of GPU nodes to GPU workers (at most one LLM node per worker)."""
         if not gpu_nodes:
             return [[]]
 
@@ -1668,10 +1668,10 @@ class DPSolver:
         dfs(0, set(), [])
         return results
 
-    # === 工具函数 ===
+    # === Helpers ===
 
     def _batch_feasible(self, nodes: Set[str], done_mask: int) -> bool:
-        """判断一个 epoch 内的节点集合是否满足依赖（父节点已完成或同批次执行）。"""
+        """Check whether a set of nodes in one epoch satisfies dependencies (parents done or in the same batch)."""
         batch_mask = done_mask
         for node_id in nodes:
             batch_mask |= 1 << self.node_index[node_id]

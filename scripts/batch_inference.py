@@ -59,7 +59,7 @@ def main() -> None:
         "--scheduler",
         type=str,
         default="dp",
-        choices=["dp", "rr_topo", "random_topo", "model_first", "greedy", "minswitch", "milp", "auto"],
+        choices=["dp", "rr_topo", "random_topo", "greedy", "minswitch", "milp", "auto"],
         help="Optimizer scheduler mode (default: dp)",
     )
     parser.add_argument(
