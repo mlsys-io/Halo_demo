@@ -5,7 +5,7 @@ import math
 import os
 from typing import Any, Callable, Dict, List, Mapping, MutableMapping, Sequence
 
-from .db import PostgresPlanExplainer, resolve_query_parameters
+from .db import PostgresPlanExplainer, planner_setting_statements, resolve_query_parameters
 from .models import DBQuery, GraphSpec, PlanMetric, QueryPlanChoice, QueryPlanOption
 from .utils import MISSING, PLACEHOLDER_PATTERN, lookup_path
 
@@ -50,11 +50,11 @@ class QueryPlanEvaluator:
                 self._explainers.append(explainer)
                 return explainer
         else:
+            # None keeps the explainer's default pool size.
+            pool_kwargs = {} if explainer_pool_size is None else {"pool_size": explainer_pool_size}
+
             def factory() -> PostgresPlanExplainer:
-                explainer = PostgresPlanExplainer(
-                    connect_kwargs=explainer_connect_kwargs,
-                    pool_size=explainer_pool_size,
-                )
+                explainer = PostgresPlanExplainer(connect_kwargs=explainer_connect_kwargs, **pool_kwargs)
                 self._explainers.append(explainer)
                 return explainer
 
@@ -105,7 +105,9 @@ class QueryPlanEvaluator:
                 params = self._resolve_params(query, contexts or (), node_id=node.id)
                 plan_choices: List[QueryPlanChoice] = []
                 for plan in plans:
-                    choice = self._evaluate_plan(node.id, query, plan, params)
+                    # With only the default plan costed nothing is chosen, so execution
+                    # keeps Postgres's default plan (no settings are pinned).
+                    choice = self._evaluate_plan(node.id, query, plan, params, pin=not default_plan_only)
                     plan_choices.append(choice)
                 plan_choices.sort(key=lambda c: c.cost if c.cost is not None else float("inf"))
                 evaluations[(node.id, query.name)] = plan_choices
@@ -117,7 +119,14 @@ class QueryPlanEvaluator:
         query: DBQuery,
         plan: QueryPlanOption,
         params: Mapping[str, Any] | None,
+        *,
+        pin: bool = True,
     ) -> QueryPlanChoice:
+        """Cost ``plan`` with EXPLAIN. A successfully costed choice carries the plan's
+        planner settings (when ``pin``) so execution can pin the chosen plan; settings
+        that execution cannot pin (only ``enable_*`` switches set on/off can be) are
+        dropped with a warning, and a statement that selects the plan keeps Postgres's
+        default plan instead of failing."""
         if params is None:
             LOGGER.warning("Skip plan %s for %s/%s: missing parameters", plan.id, node_id, query.name)
             return QueryPlanChoice(
@@ -134,6 +143,15 @@ class QueryPlanEvaluator:
             explain_json, metric = explainer.explain(query, params, settings=plan.settings)
             raw_cost, cost = self._extract_costs(explain_json)
             footprint = self._footprints_from_metric(metric)
+            settings = dict(plan.settings) if pin else {}
+            if settings:
+                try:
+                    planner_setting_statements(settings)  # the check execution applies
+                except ValueError as exc:
+                    LOGGER.warning(
+                        "Plan %s for %s/%s is not pinned at execution: %s", plan.id, node_id, query.name, exc
+                    )
+                    settings = {}
             return QueryPlanChoice(
                 plan_id=plan.id,
                 description=plan.description,
@@ -142,6 +160,7 @@ class QueryPlanEvaluator:
                 explain_json=explain_json,
                 samples=(metric,),
                 footprints=footprint,
+                settings=settings,
             )
         except Exception:
             LOGGER.exception("Failed to EXPLAIN plan %s for %s/%s", plan.id, node_id, query.name)

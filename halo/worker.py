@@ -10,8 +10,8 @@ import time
 
 from .db import DatabaseExecutor, DefaultDatabaseExecutor
 from .engines import make_llm_provider
-from .models import Node, is_llm_engine
-from .executor import DBNodeExecutor, HTTPNodeExecutor, ProcessorNodeExecutor, VLLMNodeExecutor
+from .models import ExecutionPlan, Node, is_llm_engine
+from .executor import BatchMemo, DBNodeExecutor, HTTPNodeExecutor, ProcessorNodeExecutor, VLLMNodeExecutor
 
 LOGGER = logging.getLogger(__name__)
 _RED = "\033[31m"
@@ -225,8 +225,14 @@ def cpu_worker_loop(
     result_queue: Any,
     db_executor_factory: Callable[[], DatabaseExecutor] | None = None,
     executor_kwargs: Dict[str, Any] | None = None,
+    plan: ExecutionPlan | None = None,
+    batch_memo: BatchMemo | None = None,
 ) -> None:
-    """Main loop of a CPU worker thread; handles only DB/HTTP/non-LLM nodes."""
+    """Main loop of a CPU worker thread; handles only DB/HTTP/non-LLM nodes.
+
+    With a ``plan``, SQL statements run with the physical plans the Optimizer chose,
+    and template-level operators run once per batch through ``batch_memo``.
+    """
     db_executor_factory = db_executor_factory or DefaultDatabaseExecutor
     executor_kwargs = dict(executor_kwargs or {})
     http_concurrency = executor_kwargs.pop("http_concurrency", None)
@@ -242,6 +248,9 @@ def cpu_worker_loop(
         default_sleep_s=http_default_sleep_s,
     )
     processor_executor = ProcessorNodeExecutor()
+    if plan is not None:
+        for executor in (node_executor, http_executor, processor_executor):
+            executor.bind_plan(plan, batch_memo)
     LOGGER.info("%sCPU worker %s started%s", _RED, worker_id, _RESET)
 
     while True:

@@ -6,7 +6,7 @@ import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 import threading
-from datetime import datetime
+from datetime import date, datetime
 import re
 import time
 import urllib.parse
@@ -19,8 +19,18 @@ from functools import lru_cache
 from . import metrics
 from .db import DatabaseExecutor, MissingQueryInputs, PostgresDatabaseExecutor, PostgresPlanExplainer, resolve_query_parameters
 from .engines import EngineProvider
-from .models import DBQuery, Node, is_llm_engine
-from .utils import HTTP_LATENCY_KEYS, MISSING, as_bool, http_latency_seconds, lookup_path, maybe_parse_json, render_template
+from .models import DBQuery, ExecutionPlan, GraphSpec, Node, is_llm_engine
+from .utils import (
+    HTTP_LATENCY_KEYS,
+    HTTP_PADDED_LATENCY_KEYS,
+    HTTP_SLEEP_KEYS,
+    MISSING,
+    as_bool,
+    http_latency_seconds,
+    lookup_path,
+    maybe_parse_json,
+    render_template,
+)
 from .node_processors import run_processor_node
 
 
@@ -64,16 +74,92 @@ class ExecutionStats:
 _COALESCE_CACHE_SIZE = 1024
 
 
+class WriteGeneration:
+    """Process-wide count of SQL writes, so that writes flush cached results.
+
+    Every result cache (SQL results, coalesced HTTP / processor results, and the
+    batch memo of template-level operators) stamps an entry with the generation
+    read before computing it, and drops the entry instead of serving it once a
+    later write, issued by any worker, has bumped the generation. CPU workers are
+    threads of the processor's process, so a lock-protected counter suffices;
+    GPU worker processes run only LLM nodes and keep no such caches.
+    """
+
+    __slots__ = ("_value", "_lock")
+
+    def __init__(self) -> None:
+        self._value = 0
+        self._lock = threading.Lock()
+
+    def current(self) -> int:
+        return self._value
+
+    def bump(self) -> None:
+        with self._lock:
+            self._value += 1
+
+
+WRITE_GENERATION = WriteGeneration()
+
+
+class BatchMemo:
+    """Results of template-level operators for the current batch.
+
+    Shared by the executors of a processor's CPU workers. Unlike the bounded
+    result caches it never evicts: the processor resets it at the start of every
+    batch, and an entry computed before a later SQL write is dropped.
+    """
+
+    __slots__ = ("_entries", "_lock")
+
+    def __init__(self) -> None:
+        self._entries: Dict[tuple[str, str | None], tuple[int, Any]] = {}
+        self._lock = threading.Lock()
+
+    def reset(self) -> None:
+        with self._lock:
+            self._entries.clear()
+
+    def get(self, key: tuple[str, str | None]) -> Any:
+        """The memoized result, or ``MISSING`` if absent or cached before the last write."""
+        generation = WRITE_GENERATION.current()
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                return MISSING
+            if entry[0] < generation:
+                del self._entries[key]
+                return MISSING
+            return entry[1]
+
+    def put(self, key: tuple[str, str | None], result: Any, generation: int) -> None:
+        """Keep ``result``, computed after reading write generation ``generation``."""
+        with self._lock:
+            self._entries[key] = (generation, result)
+
+
 @dataclass(slots=True)
 class _BaseExecutor:
     _stats: ExecutionStats = field(init=False, repr=False)
     _stats_lock: threading.Lock = field(init=False, repr=False)
-    _coalesce_cache: "OrderedDict[str, Dict[str, Any]]" = field(init=False, repr=False)
+    # (spec, signature) -> (write generation, result); see WriteGeneration.
+    _coalesce_cache: "OrderedDict[tuple[str, str], tuple[int, Dict[str, Any]]]" = field(init=False, repr=False)
+    # Template-level operators of the bound plan, and the batch memo that serves them.
+    _template_ops: frozenset[tuple[str, str | None]] = field(init=False, repr=False)
+    _batch_memo: BatchMemo | None = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._stats = ExecutionStats()
         self._stats_lock = threading.Lock()
         self._coalesce_cache = OrderedDict()
+        self._template_ops = frozenset()
+        self._batch_memo = None
+
+    def bind_plan(self, plan: ExecutionPlan, batch_memo: BatchMemo | None) -> None:
+        """Apply ``plan``'s compile-time decisions: its template-level operators run
+        once per batch through ``batch_memo`` (without a memo they run as usual)."""
+        self._template_ops = frozenset(plan.template_level_ops) if batch_memo is not None else frozenset()
+        self._batch_memo = batch_memo
 
     def clear_caches(self) -> None:
         """Drop results kept across micro-batches (e.g. after a write)."""
@@ -132,21 +218,23 @@ class _BaseExecutor:
         Only used for operators declared ``coalesce: true`` (deterministic and
         side-effect free); every context receives its own deep copy. Results are
         also kept in a bounded cache so identical calls in later micro-batches
-        reuse them; keys include the operator's full specification.
+        reuse them until a SQL write flushes them; keys include the operator's
+        full specification.
         """
         spec = _node_fingerprint(node)
         signatures = [(spec, signature_fn(node, ctx)) for ctx in contexts]
         results: Dict[tuple[str, str], Dict[str, Any]] = {}
         owner: Dict[tuple[str, str], int] = {}
+        generation = WRITE_GENERATION.current()
         with self._stats_lock:
             for idx, sig in enumerate(signatures):
                 if sig in results or sig in owner:
                     continue
                 cached = self._coalesce_cache.get(sig)
-                if cached is not None:
+                if cached is not None and cached[0] >= generation:
                     self._coalesce_cache.move_to_end(sig)
-                    results[sig] = cached
-                else:
+                    results[sig] = cached[1]
+                else:  # not cached, or cached before a later write
                     owner[sig] = idx
         if pool is not None and len(owner) > 1:
             future_map = {pool.submit(run_once, node, contexts[idx]): sig for sig, idx in owner.items()}
@@ -157,11 +245,36 @@ class _BaseExecutor:
                 results[sig] = run_once(node, contexts[idx])
         with self._stats_lock:
             for sig in owner:
-                self._coalesce_cache[sig] = results[sig]
+                self._coalesce_cache[sig] = (generation, results[sig])
                 self._coalesce_cache.move_to_end(sig)
             while len(self._coalesce_cache) > _COALESCE_CACHE_SIZE:
                 self._coalesce_cache.popitem(last=False)
         return [copy.deepcopy(results[sig]) for sig in signatures]
+
+    def _is_template_level(self, node: Node) -> bool:
+        return (node.id, None) in self._template_ops and coalescing_enabled(node)
+
+    def _execute_template_level(
+        self,
+        node: Node,
+        contexts: Sequence[Mapping[str, Any]],
+        run_once: Callable[[Node, Mapping[str, Any]], Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Run a template-level operator once per batch and fan its result out.
+
+        Its arguments are template-stable (decided at compile time), so a single
+        execution serves every instance of every micro-batch in the batch; every
+        context receives its own deep copy.
+        """
+        if not contexts:
+            return []
+        key = (node.id, None)
+        result = self._batch_memo.get(key)
+        if result is MISSING:
+            generation = WRITE_GENERATION.current()
+            result = run_once(node, contexts[0])
+            self._batch_memo.put(key, result, generation)
+        return [copy.deepcopy(result) for _ in contexts]
 
 
 _SQL_READ_STARTS = ("select", "with", "values", "table")
@@ -302,6 +415,90 @@ def _http_signature(node: Node, context: Mapping[str, Any]) -> str:
     return _input_signature(node, context, request)
 
 
+def _unbound_request_inputs(raw: Mapping[str, Any], context: Mapping[str, Any]) -> List[str]:
+    """Placeholders in an HTTP node's request fields that ``context`` cannot bind."""
+    missing: List[str] = []
+
+    def visit(value: Any) -> None:
+        if isinstance(value, str):
+            render_template(value, context, on_missing=lambda key, _template: missing.append(key))
+        elif isinstance(value, Mapping):
+            for item in value.values():
+                visit(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                visit(item)
+
+    for key in _HTTP_REQUEST_FIELDS:
+        if key in raw:
+            visit(raw[key])
+    return list(dict.fromkeys(missing))
+
+
+def _payload_outputs(node: Node, payload: Any) -> Dict[str, Any]:
+    """Map an HTTP response payload onto the node's outputs."""
+    if not node.outputs:
+        return {}
+    if len(node.outputs) == 1:
+        return {node.outputs[0]: payload}
+    if isinstance(payload, Mapping):
+        return {name: payload.get(name) for name in node.outputs}
+    return {name: copy.deepcopy(payload) for name in node.outputs}
+
+
+def _request_timeout_s(request: Mapping[str, Any]) -> float:
+    """Timeout of a live request: its rendered ``timeout_s`` / ``timeout_ms`` (default 60 s)."""
+    if "timeout_s" in request:
+        return float(request["timeout_s"])
+    if "timeout_ms" in request:
+        return float(request["timeout_ms"]) / 1000.0
+    return 60.0
+
+
+def template_level_ops(graph: GraphSpec) -> frozenset[tuple[str, str | None]]:
+    """Template-level work, decided at compile time.
+
+    An eligible operator whose arguments are template-stable computes the same
+    result for every query of a batch, so it runs once per batch and its result is
+    fanned out to all instances:
+    - ``(node_id, query_name)``: a read-only, non-volatile SQL statement (not
+      ``coalesce: false``) without ``required_inputs`` whose parameters are
+      literal constants;
+    - ``(node_id, None)``: an HTTP node declared ``coalesce: true`` whose request
+      fields reference no query field.
+    Local-function (processor) nodes never qualify: a processor receives the query
+    context and may read any field of it, even with an empty ``inputs`` list (e.g.
+    ``regex_param_extractor`` then falls back to ``user_query``).
+    """
+    ops: set[tuple[str, str | None]] = set()
+    for node in graph.nodes.values():
+        raw = node.raw if isinstance(node.raw, Mapping) else {}
+        if node.engine == "db":
+            for query in node.db_queries:
+                if (
+                    query.coalesce
+                    and sql_coalescible(query.sql)
+                    and not query.required_inputs
+                    and not _references_context(query.parameters)
+                ):
+                    ops.add((node.id, query.name))
+        elif node.engine == "http" and coalescing_enabled(node):
+            if not any(_references_context(raw[key]) for key in _HTTP_REQUEST_FIELDS if key in raw):
+                ops.add((node.id, None))
+    return frozenset(ops)
+
+
+def _references_context(value: Any) -> bool:
+    """Whether a templated value may read the query context (any ``{{`` placeholder)."""
+    if isinstance(value, str):
+        return "{{" in value
+    if isinstance(value, Mapping):
+        return any(_references_context(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_references_context(item) for item in value)
+    return False
+
+
 @dataclass(slots=True)
 class DBNodeExecutor(_BaseExecutor):
     """Only handles DB nodes."""
@@ -316,12 +513,16 @@ class DBNodeExecutor(_BaseExecutor):
     db_explain_mode: str = "wrap"  # "wrap" (run + explain) or "replace" (explain only)
     db_explain_sample_rate: float = 1.0
     _thread_pool: ThreadPoolExecutor | None = field(init=False, repr=False, default=None)
-    _result_cache: "OrderedDict[tuple, Mapping[str, Any]]" = field(init=False, repr=False)
+    # cache_key -> (write generation, result); see WriteGeneration.
+    _result_cache: "OrderedDict[tuple, tuple[int, Mapping[str, Any]]]" = field(init=False, repr=False)
     _result_cache_lock: threading.Lock = field(init=False, repr=False)
     _plan_explainer: PostgresPlanExplainer | None = field(init=False, repr=False, default=None)
+    # (node_id, query_name) -> planner settings of the physical plan the Optimizer chose.
+    _plan_settings: Dict[tuple[str, str], Mapping[str, Any]] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         _BaseExecutor.__post_init__(self)
+        self._plan_settings = {}
         if self.db_concurrency > 1:
             # Reuse a small thread pool across queries to avoid per-call creation overhead.
             self._thread_pool = ThreadPoolExecutor(max_workers=self.db_concurrency)
@@ -342,6 +543,13 @@ class DBNodeExecutor(_BaseExecutor):
             self._plan_explainer = self._maybe_build_plan_explainer()
             if self._plan_explainer is not None:
                 self._apply_prepare_settings(self._plan_explainer)
+
+    def bind_plan(self, plan: ExecutionPlan, batch_memo: BatchMemo | None) -> None:
+        """Also pin every SQL statement to the physical plan the Optimizer chose for it."""
+        _BaseExecutor.bind_plan(self, plan, batch_memo)
+        self._plan_settings = {
+            key: dict(choice.settings) for key, choice in plan.selected_query_plans.items() if choice.settings
+        }
 
     def execute(self, node: Node, context: Mapping[str, Any]) -> Dict[str, Any]:
         self._begin_execution()
@@ -413,20 +621,37 @@ class DBNodeExecutor(_BaseExecutor):
         if not queries:
             return [[] for _ in range(num_contexts)]
         if not self.enable_result_cache:
-            return self._run_db_queries_no_cache(node, contexts, queries)
+            # No sharing at all (template-level statements included); writes still
+            # flush the results other executors keep.
+            try:
+                return self._run_db_queries_no_cache(node, contexts, queries)
+            finally:
+                if any(sql_is_write(query.sql) for query in queries):
+                    WRITE_GENERATION.bump()
 
         results_per_context: List[List[Mapping[str, Any]]] = [[] for _ in range(num_contexts)]
         batch_result_cache: Dict[tuple, Mapping[str, Any]] = {}
+        # Results computed below are stamped with the generation read before running
+        # them, so a write meanwhile (by any worker) keeps them from being served later.
+        generation = WRITE_GENERATION.current()
 
         for query in queries:
             if not (query.coalesce and sql_coalescible(query.sql)):
                 # Writes / volatile functions run once per query (no sharing, no cache).
-                for idx, results in enumerate(self._run_db_queries_no_cache(node, contexts, [query])):
-                    results_per_context[idx].extend(results)
-                if sql_is_write(query.sql):
-                    # Later reads must observe the write.
-                    batch_result_cache.clear()
-                    self.clear_caches()
+                try:
+                    for idx, results in enumerate(self._run_db_queries_no_cache(node, contexts, [query])):
+                        results_per_context[idx].extend(results)
+                finally:
+                    if sql_is_write(query.sql):
+                        # Later reads must observe the write: flush cached results in every worker.
+                        batch_result_cache.clear()
+                        WRITE_GENERATION.bump()
+                continue
+            if (node.id, query.name) in self._template_ops:
+                # Template-level statement: one execution per batch serves every instance.
+                result = self._run_template_level_query(node, query, contexts)
+                for results in results_per_context:
+                    results.append(result)
                 continue
             per_ctx_params: List[tuple[Dict[str, Any], bool]] = []
             signature_owner: Dict[str, int] = {}
@@ -483,9 +708,27 @@ class DBNodeExecutor(_BaseExecutor):
 
             # Flush this query's batch results into the global LRU (bounded).
             for cache_key, result in batch_result_cache.items():
-                self._cache_result(cache_key, result)
+                self._cache_result(cache_key, result, generation)
 
         return results_per_context
+
+    def _run_template_level_query(
+        self,
+        node: Node,
+        query: DBQuery,
+        contexts: Sequence[Mapping[str, Any]],
+    ) -> Mapping[str, Any]:
+        """Run a template-stable statement (literal parameters) once per batch."""
+        key = (node.id, query.name)
+        result = self._batch_memo.get(key)
+        if result is MISSING:
+            generation = WRITE_GENERATION.current()
+            params, missing = resolve_query_parameters(query, contexts[0], node_id=node.id)
+            if missing:
+                return self._make_missing_query_result(query, params)
+            result = self._run_query_with_fallback(query, contexts[0], node.id, params)
+            self._batch_memo.put(key, result, generation)
+        return result
 
     def _run_db_queries_no_cache(
         self,
@@ -541,12 +784,12 @@ class DBNodeExecutor(_BaseExecutor):
         with self._result_cache_lock:
             self._result_cache.clear()
 
-    def _cache_result(self, cache_key: tuple, result: Mapping[str, Any]) -> None:
-        """Store a result in the instance-level LRU cache."""
+    def _cache_result(self, cache_key: tuple, result: Mapping[str, Any], generation: int) -> None:
+        """Store a result, computed after reading write generation ``generation``, in the LRU cache."""
         if not self.enable_result_cache or self.result_cache_size <= 0:
             return
         with self._result_cache_lock:
-            self._result_cache[cache_key] = result
+            self._result_cache[cache_key] = (generation, result)
             self._result_cache.move_to_end(cache_key)
             while len(self._result_cache) > self.result_cache_size:
                 self._result_cache.popitem(last=False)
@@ -554,12 +797,17 @@ class DBNodeExecutor(_BaseExecutor):
     def _get_cached_result(self, cache_key: tuple) -> Mapping[str, Any] | None:
         if not self.enable_result_cache or self.result_cache_size <= 0:
             return None
+        generation = WRITE_GENERATION.current()
         with self._result_cache_lock:
-            result = self._result_cache.get(cache_key)
-            if result is None:
+            entry = self._result_cache.get(cache_key)
+            if entry is None:
+                return None
+            if entry[0] < generation:
+                # Cached before a later SQL write (by any worker): drop it.
+                del self._result_cache[cache_key]
                 return None
             self._result_cache.move_to_end(cache_key)
-            return result
+            return entry[1]
 
     def _serialize_parameters(self, params: Mapping[str, Any]) -> tuple:
         """Build a hashable signature for ``params`` without going through JSON.
@@ -614,19 +862,34 @@ class DBNodeExecutor(_BaseExecutor):
         *,
         node_id: str,
     ) -> Mapping[str, Any]:
+        # Planner settings of the physical plan the Optimizer chose for this statement.
+        settings = self._plan_settings.get((node_id, query.name))
         start_time = time.perf_counter()
         result: Mapping[str, Any]
         try:
             if self.enable_db_explain_analyze and self.db_explain_mode == "replace":
-                result = self._run_db_query_explain_only(query, context, node_id=node_id)
+                result = self._run_db_query_explain_only(query, context, node_id=node_id, settings=settings)
             else:
-                result = self.db_executor.run(query, context, node_id=node_id)
+                result = self._run_statement(query, context, node_id=node_id, settings=settings)
         finally:
             self._record_db_time(time.perf_counter() - start_time)
 
         if self.enable_db_explain_analyze and self.db_explain_mode == "wrap":
-            self._maybe_record_explain(query, node_id=node_id, result=result)
+            self._maybe_record_explain(query, node_id=node_id, result=result, settings=settings)
         return result
+
+    def _run_statement(
+        self,
+        query: DBQuery,
+        context: Mapping[str, Any],
+        *,
+        node_id: str,
+        settings: Mapping[str, Any] | None,
+    ) -> Mapping[str, Any]:
+        if settings:
+            return self.db_executor.run(query, context, node_id=node_id, settings=settings)
+        # The Postgres default plan pins nothing and keeps the plain call.
+        return self.db_executor.run(query, context, node_id=node_id)
 
     def _maybe_build_plan_explainer(self) -> PostgresPlanExplainer | None:
         if not isinstance(self.db_executor, PostgresDatabaseExecutor):
@@ -666,7 +929,14 @@ class DBNodeExecutor(_BaseExecutor):
             return None
         return None
 
-    def _maybe_record_explain(self, query: DBQuery, *, node_id: str, result: Mapping[str, Any]) -> None:
+    def _maybe_record_explain(
+        self,
+        query: DBQuery,
+        *,
+        node_id: str,
+        result: Mapping[str, Any],
+        settings: Mapping[str, Any] | None = None,
+    ) -> None:
         explainer = self._plan_explainer
         if explainer is None:
             return
@@ -680,7 +950,7 @@ class DBNodeExecutor(_BaseExecutor):
         if not isinstance(params, Mapping):
             return
         try:
-            plan_json, plan_metric = explainer.explain(query, params, settings=None)
+            plan_json, plan_metric = explainer.explain(query, params, settings=settings or None)
         except Exception:
             return
         planned_cost = self._extract_planned_total_cost(plan_json)
@@ -703,15 +973,16 @@ class DBNodeExecutor(_BaseExecutor):
         context: Mapping[str, Any],
         *,
         node_id: str,
+        settings: Mapping[str, Any] | None = None,
     ) -> Mapping[str, Any]:
         explainer = self._plan_explainer
         if explainer is None:
             # Fallback to normal execution if explain is unavailable.
-            return self.db_executor.run(query, context, node_id=node_id)
+            return self._run_statement(query, context, node_id=node_id, settings=settings)
         params, missing = resolve_query_parameters(query, context, node_id=node_id)
         if missing:
             raise MissingQueryInputs(query.name, missing)
-        plan_json, plan_metric = explainer.explain(query, params, settings=None)
+        plan_json, plan_metric = explainer.explain(query, params, settings=settings or None)
         planned_cost = self._extract_planned_total_cost(plan_json)
         query_key = f"{node_id}:{query.name}"
         metrics.record_db_explain(
@@ -751,12 +1022,19 @@ class DBNodeExecutor(_BaseExecutor):
 
 @dataclass(slots=True)
 class HTTPNodeExecutor(_BaseExecutor):
-    """Executes HTTP nodes.
+    """Executes HTTP nodes in one of three modes, chosen by the keys a node declares:
 
-    A node that declares a ``url`` and no latency key issues the templated request
-    live (e.g. an API-served LLM call to an OpenAI-compatible endpoint); a node that
-    declares a latency (``sleep_s``, ``latency_ms``, ...) is served by latency
-    injection, a Gamma-distributed sleep around that mean, for reproducible runs.
+    - live: a ``url`` without a latency key issues the templated request (e.g. an
+      API-served LLM call to an OpenAI-compatible endpoint); ``timeout_s`` /
+      ``timeout_ms`` set its request timeout.
+    - padded: a ``url`` with ``latency_s`` / ``latency_ms`` issues the request, then
+      pads the call to a Gamma-distributed latency around that mean, sleeping only
+      for the remainder (a slower response is never cut short); the response payload
+      passes through to downstream nodes as in live mode. This keeps the paper's
+      latency model while the call returns real data.
+    - latency injection: ``sleep_s`` / ``sleep_ms`` (and, on a node without a
+      ``url``, any latency key) only sleep for a Gamma-distributed time around that
+      mean, for reproducible runs; a ``url`` is then never contacted.
     """
 
     http_concurrency: int = 32
@@ -783,6 +1061,8 @@ class HTTPNodeExecutor(_BaseExecutor):
             return []
         if node.engine != "http":
             raise RuntimeError(f"HTTPNodeExecutor only supports engine='http' (got {node.engine})")
+        if self._is_template_level(node):
+            return self._execute_template_level(node, contexts, self._execute_http_once)
         if coalescing_enabled(node):
             return self._execute_coalesced(
                 node, contexts, _http_signature, self._execute_http_once, pool=self._thread_pool
@@ -801,8 +1081,11 @@ class HTTPNodeExecutor(_BaseExecutor):
 
     def _execute_http_once(self, node: Node, context: Mapping[str, Any]) -> Dict[str, Any]:
         raw = node.raw if isinstance(node.raw, Mapping) else {}
-        if raw.get("url") and not any(key in raw for key, _ in HTTP_LATENCY_KEYS):
-            return self._execute_live(node, raw, context)
+        if raw.get("url"):
+            if any(key in raw for key, _ in HTTP_PADDED_LATENCY_KEYS):
+                return self._execute_padded(node, raw, context)
+            if not any(key in raw for key in HTTP_SLEEP_KEYS):
+                return self._execute_live(node, raw, context)
         mean_sleep_s = self._resolve_sleep_seconds(node, context)
         sleep_s = self._sample_sleep_seconds(mean_sleep_s)
         start_time = time.perf_counter()
@@ -811,10 +1094,44 @@ class HTTPNodeExecutor(_BaseExecutor):
         self._record_api_time(time.perf_counter() - start_time, count=1)
         return self._build_outputs(node, sleep_s)
 
-    def _execute_live(self, node: Node, raw: Mapping[str, Any], context: Mapping[str, Any]) -> Dict[str, Any]:
+    def _execute_padded(self, node: Node, raw: Mapping[str, Any], context: Mapping[str, Any]) -> Dict[str, Any]:
+        """Issue the node's request, then pad the call to a latency sampled around its
+        ``latency_s`` / ``latency_ms`` mean by sleeping only for the remainder.
+
+        A request whose fields reference inputs the context lacks (e.g. upstream
+        outputs while the planner profiles the node on sample contexts) is not sent:
+        like a SQL statement with missing parameters it yields a ``skipped`` payload,
+        and the call still takes its sampled latency.
+        """
+        target_s = self._sample_sleep_seconds(self._resolve_sleep_seconds(node, context, HTTP_PADDED_LATENCY_KEYS))
+        start_time = time.perf_counter()
+        missing = _unbound_request_inputs(raw, context)
+        if missing:
+            outputs = _payload_outputs(node, {
+                "status": "skipped",
+                "note": f"Request not sent: missing inputs {', '.join(missing)}.",
+                "missing_inputs": missing,
+            })
+        else:
+            outputs = self._execute_live(node, raw, context, record_time=False)
+        remaining_s = target_s - (time.perf_counter() - start_time)
+        if remaining_s > 0:
+            time.sleep(remaining_s)
+        self._record_api_time(time.perf_counter() - start_time, count=1)
+        return outputs
+
+    def _execute_live(
+        self,
+        node: Node,
+        raw: Mapping[str, Any],
+        context: Mapping[str, Any],
+        *,
+        record_time: bool = True,
+    ) -> Dict[str, Any]:
         """Issue the node's request: ``url`` with optional ``method``, ``params``/``query``,
-        ``headers``, ``json``/``body`` (all templated), ``timeout_s``, and ``response_path``
-        (a dotted path into the JSON response, e.g. ``choices.0.message.content``)."""
+        ``headers``, ``json``/``body`` (all templated), ``timeout_s`` / ``timeout_ms``, and
+        ``response_path`` (a dotted path into the JSON response, e.g.
+        ``choices.0.message.content``)."""
         request = {key: _render_nested(raw[key], context) for key in _HTTP_REQUEST_FIELDS if key in raw}
         url = str(request["url"])
         params = request.get("params", request.get("query"))
@@ -832,22 +1149,22 @@ class HTTPNodeExecutor(_BaseExecutor):
         method = str(request.get("method") or ("POST" if data is not None else "GET")).upper()
         start_time = time.perf_counter()
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
-        with urllib.request.urlopen(req, timeout=float(raw.get("timeout_s", 60))) as response:
+        with urllib.request.urlopen(req, timeout=_request_timeout_s(request)) as response:
             text = response.read().decode(response.headers.get_content_charset() or "utf-8")
-        self._record_api_time(time.perf_counter() - start_time, count=1)
+        if record_time:
+            self._record_api_time(time.perf_counter() - start_time, count=1)
         payload = maybe_parse_json(text)
         if raw.get("response_path"):
             payload = lookup_path(payload, str(raw["response_path"]), default=None)
-        if not node.outputs:
-            return {}
-        if len(node.outputs) == 1:
-            return {node.outputs[0]: payload}
-        if isinstance(payload, Mapping):
-            return {name: payload.get(name) for name in node.outputs}
-        return {name: copy.deepcopy(payload) for name in node.outputs}
+        return _payload_outputs(node, payload)
 
-    def _resolve_sleep_seconds(self, node: Node, context: Mapping[str, Any]) -> float:
-        seconds = http_latency_seconds(node.raw or {}, render=lambda v: render_template(v, context))
+    def _resolve_sleep_seconds(
+        self,
+        node: Node,
+        context: Mapping[str, Any],
+        keys: Sequence[tuple[str, float]] = HTTP_LATENCY_KEYS,
+    ) -> float:
+        seconds = http_latency_seconds(node.raw or {}, render=lambda v: render_template(v, context), keys=keys)
         return self.default_sleep_s if seconds is None else seconds
 
     def _sample_sleep_seconds(self, mean_sleep_s: float) -> float:
@@ -888,6 +1205,7 @@ class ProcessorNodeExecutor(_BaseExecutor):
             raise RuntimeError(
                 f"ProcessorNodeExecutor only supports type='processor' (got type={node.type})"
             )
+        # Never template-level (see template_level_ops): a processor may read any context field.
         if coalescing_enabled(node):
             return self._execute_coalesced(node, contexts, _input_signature, run_processor_node)
         return [run_processor_node(node, ctx) for ctx in contexts]
@@ -1023,7 +1341,7 @@ class VLLMNodeExecutor(_BaseExecutor):
             if cached is not None:
                 return cached
         prepared = self._prepare_result_for_prompt(result)
-        encoded = json.dumps(prepared, ensure_ascii=False)
+        encoded = json.dumps(prepared, ensure_ascii=False, default=str)
         if serialize_cache is not None:
             serialize_cache[id(result)] = encoded
         return encoded
@@ -1100,7 +1418,7 @@ class VLLMNodeExecutor(_BaseExecutor):
                 return float(value)
             except (ValueError, OverflowError):
                 return str(value)
-        if isinstance(value, datetime):
+        if isinstance(value, (date, datetime)):  # DATE and TIMESTAMP columns
             return value.isoformat()
         if isinstance(value, Mapping):
             return {k: self._sanitize_value(v, max_chars) for k, v in value.items()}

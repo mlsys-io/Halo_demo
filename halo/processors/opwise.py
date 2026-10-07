@@ -58,6 +58,7 @@ class OpwiseGraphProcessor(BaseGraphProcessor):
         if not initial_inputs_list:
             return []
 
+        self._begin_batch(plan)
         monitor = start_system_monitor(graph.name)
         progress_monitor = start_progress_monitor(
             graph.name,

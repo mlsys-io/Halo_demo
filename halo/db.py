@@ -69,7 +69,33 @@ class DatabaseExecutor(Protocol):
         context: Mapping[str, Any],
         *,
         node_id: str | None = None,
+        settings: Mapping[str, Any] | None = None,
     ) -> Any: ...
+
+
+# A physical plan is pinned with PostgreSQL's planner method switches
+# (enable_seqscan, enable_hashjoin, ...), each set on or off.
+_PLANNER_SWITCH_RE = re.compile(r"enable_[a-z_]+")
+
+
+def planner_setting_statements(settings: Mapping[str, Any]) -> List[str]:
+    """``SET LOCAL`` statements that pin a physical plan's planner switches.
+
+    Only ``enable_*`` switches set to on/off are accepted; names and values are
+    checked against fixed patterns, so no template text reaches the SQL as is.
+    """
+    statements: List[str] = []
+    for name, value in settings.items():
+        if not isinstance(name, str) or not _PLANNER_SWITCH_RE.fullmatch(name):
+            raise ValueError(f"Unsupported planner setting {name!r}: a plan can only pin enable_* switches.")
+        if isinstance(value, bool):
+            literal = "on" if value else "off"
+        elif isinstance(value, str) and value.strip().lower() in ("on", "off"):
+            literal = value.strip().lower()
+        else:
+            raise ValueError(f"Planner setting {name} must be on or off (got {value!r}).")
+        statements.append(f"SET LOCAL {name} = {literal}")
+    return statements
 
 
 class _BaseDatabaseExecutor:
@@ -108,6 +134,7 @@ class DefaultDatabaseExecutor(_BaseDatabaseExecutor):
         context: Mapping[str, Any],
         *,
         node_id: str | None = None,
+        settings: Mapping[str, Any] | None = None,
     ) -> Dict[str, Any]:
         params, missing = self._resolve_parameters(query, context, node_id=node_id)
         if missing:
@@ -164,28 +191,57 @@ class PostgresDatabaseExecutor(_BaseDatabaseExecutor):
         context: Mapping[str, Any],
         *,
         node_id: str | None = None,
+        settings: Mapping[str, Any] | None = None,
     ) -> Dict[str, Any]:
+        """Execute ``query``; non-empty ``settings`` pin the physical plan the Optimizer chose."""
         sql = self._format_sql(query)
         params, missing = self._resolve_parameters(query, context, node_id=node_id)
         if missing:
             raise MissingQueryInputs(query.name, missing)
+        set_local = planner_setting_statements(settings) if settings else []
 
         with self._connection() as conn:
             if self.autocommit:
                 conn.autocommit = True
+            if set_local:
+                # SET LOCAL lasts until the end of the transaction, so the settings apply
+                # to this statement only and reset at commit (or rollback); transaction()
+                # opens that transaction even on an autocommit connection. The statements
+                # run unprepared: a prepared statement's cached generic plan would
+                # ignore the switches.
+                with conn.transaction(), conn.cursor() as cur:
+                    for statement in set_local:
+                        cur.execute(statement, prepare=False)
+                    return self._execute(cur, query, sql, params, node_id=node_id, prepare=False)
             with conn.cursor() as cur:
-                cur.execute(sql, params)
-                rows = cur.fetchall() if cur.description else []
-                result = _build_result_dict(
-                    query,
-                    sql_text=query.sql,
-                    executed_sql=sql,
-                    parameters=params,
-                    rows=rows,
-                    rowcount=cur.rowcount,
-                )
-                self._log_result(node_id, query.name, result)
-                return result
+                return self._execute(cur, query, sql, params, node_id=node_id)
+
+    def _execute(
+        self,
+        cur: "psycopg.Cursor[Any]",
+        query: DBQuery,
+        sql: str,
+        params: Mapping[str, Any],
+        *,
+        node_id: str | None,
+        prepare: bool | None = None,
+    ) -> Dict[str, Any]:
+        """Run one statement; ``prepare=None`` leaves preparation to ``prepare_threshold``."""
+        if prepare is None:
+            cur.execute(sql, params)
+        else:
+            cur.execute(sql, params, prepare=prepare)
+        rows = cur.fetchall() if cur.description else []
+        result = _build_result_dict(
+            query,
+            sql_text=query.sql,
+            executed_sql=sql,
+            parameters=params,
+            rows=rows,
+            rowcount=cur.rowcount,
+        )
+        self._log_result(node_id, query.name, result)
+        return result
 
     def _format_sql(self, query: DBQuery) -> str:
         """Convert :named parameters to psycopg's %(name)s style."""
@@ -299,29 +355,31 @@ class PostgresPlanExplainer(PostgresDatabaseExecutor):
             options.insert(0, "ANALYZE")
         explain_sql = f"EXPLAIN ({', '.join(options)}) {sql}"
         with self._connection() as conn:
-            with conn.cursor() as cur:
-                reset_keys: List[str] = []
-                if settings:
-                    for key, value in settings.items():
-                        self._apply_setting(cur, key, value)
-                        reset_keys.append(key)
+            if not conn.autocommit:
+                conn.rollback()  # end any implicit transaction before switching modes
+                conn.autocommit = True
+            # One explicit transaction per EXPLAIN, always rolled back: the SETs (and any
+            # EXPLAIN ANALYZE side effects) end with it instead of outliving the EXPLAIN
+            # on the pooled connection, and a failed EXPLAIN raises its own error rather
+            # than a follow-up statement failing on the aborted transaction.
+            with conn.transaction(force_rollback=True), conn.cursor() as cur:
+                for key, value in (settings or {}).items():
+                    self._apply_setting(cur, key, value)
                 cur.execute(explain_sql, params)
                 rows = cur.fetchall()
-                plan_json = None
-                if rows:
-                    first_row = rows[0]
-                    if isinstance(first_row, Mapping):
-                        plan_json = first_row.get("QUERY PLAN")
-                        if plan_json is None and first_row:
-                            plan_json = next(iter(first_row.values()))
-                    elif isinstance(first_row, Sequence):
-                        plan_json = first_row[0] if first_row else None
-                    else:
-                        plan_json = first_row
-                for key in reset_keys:
-                    cur.execute(f"RESET {key}")
-                plan_json, metrics = self._extract_plan_metrics(plan_json)
-                return plan_json, metrics
+        plan_json = None
+        if rows:
+            first_row = rows[0]
+            if isinstance(first_row, Mapping):
+                plan_json = first_row.get("QUERY PLAN")
+                if plan_json is None and first_row:
+                    plan_json = next(iter(first_row.values()))
+            elif isinstance(first_row, Sequence):
+                plan_json = first_row[0] if first_row else None
+            else:
+                plan_json = first_row
+        plan_json, metrics = self._extract_plan_metrics(plan_json)
+        return plan_json, metrics
 
     _SETTING_KEY_RE = re.compile(r"^[a-zA-Z_][\w.]*$")
 

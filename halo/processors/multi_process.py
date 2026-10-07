@@ -16,6 +16,7 @@ from ..db import (
     DefaultDatabaseExecutor,
     make_peer_postgres_executor,
 )
+from ..executor import BatchMemo
 from ..models import ExecutionPlan, ExecutionTask, GraphSpec, Node, is_llm_engine, llm_model_key
 from ..monitoring import ProgressMonitor, start_progress_monitor, start_system_monitor
 from ..worker import (
@@ -131,6 +132,8 @@ class MultiProcessGraphProcessor:
         self._worker_plan_id: int | None = None
         self._worker_lock = threading.Lock()
         self.enforce_epoch_barrier = bool(enforce_epoch_barrier)
+        # Results of template-level operators, shared by all CPU workers for one batch.
+        self._batch_memo = BatchMemo()
 
     def _resolve_batch_size(self, num_queries: int) -> None:
         if self._auto_batch_size:
@@ -174,6 +177,7 @@ class MultiProcessGraphProcessor:
             worker_state = self._start_workers(plan)
 
         workers, task_queues, result_queue, gpu_result_queue = worker_state
+        self._batch_memo.reset()  # template-level operators run once per batch
         monitor = start_system_monitor(graph.name)
         progress_monitor = start_progress_monitor(
             graph.name,
@@ -270,6 +274,7 @@ class MultiProcessGraphProcessor:
                 handle = threading.Thread(
                     target=cpu_worker_loop,
                     args=(worker_id, task_q, unified_result_queue, self.db_executor_factory, cpu_exec_kwargs),
+                    kwargs={"plan": plan, "batch_memo": self._batch_memo},
                     daemon=True,
                 )
                 handle.start()

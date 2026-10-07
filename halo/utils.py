@@ -72,10 +72,20 @@ HTTP_LATENCY_KEYS = (
     ("timeout_ms", 0.001),
 )
 
+# On a node with a ``url``, these declare the latency of the real call (the request is
+# issued and the call padded to a sampled latency), the sleep keys inject latency alone
+# (the url is not contacted), and ``timeout_s``/``timeout_ms`` set the request timeout.
+HTTP_PADDED_LATENCY_KEYS = (("latency_s", 1.0), ("latency_ms", 0.001))
+HTTP_SLEEP_KEYS = ("sleep_s", "sleep_ms")
 
-def http_latency_seconds(raw: Mapping[str, Any], render: Callable[[str], str] | None = None) -> float | None:
-    """The first parseable declared latency in ``raw`` (seconds, >= 0), or None."""
-    for key, scale in HTTP_LATENCY_KEYS:
+
+def http_latency_seconds(
+    raw: Mapping[str, Any],
+    render: Callable[[str], str] | None = None,
+    keys: Sequence[tuple[str, float]] = HTTP_LATENCY_KEYS,
+) -> float | None:
+    """The first parseable declared latency in ``raw`` among ``keys`` (seconds, >= 0), or None."""
+    for key, scale in keys:
         if key not in raw:
             continue
         value = raw[key]

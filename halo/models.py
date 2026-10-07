@@ -64,6 +64,8 @@ class QueryPlanChoice:
     explain_json: Any | None = None
     samples: Sequence["PlanMetric"] = field(default_factory=tuple)
     footprints: Mapping[str, int] = field(default_factory=dict)
+    # Planner settings that pin this plan at execution time (empty: Postgres default plan).
+    settings: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,13 +135,16 @@ class ExecutionTask:
 
 @dataclass(frozen=True, slots=True)
 class ExecutionPlan:
-    """Result of the optimizer: worker descriptions, task order, and query-plan choices."""
+    """Result of the optimizer: worker descriptions, task order, query-plan choices,
+    and the template-level operators that run once per batch."""
 
     workers: Dict[str, Worker]
     tasks: Sequence[ExecutionTask]
     query_plans: Mapping[tuple[str, str], Sequence[QueryPlanChoice]] = field(default_factory=dict)
     selected_query_plans: Mapping[tuple[str, str], QueryPlanChoice] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
+    # (node_id, query_name) for SQL statements, (node_id, None) for HTTP nodes.
+    template_level_ops: frozenset[tuple[str, str | None]] = frozenset()
 
 
 class GraphValidationError(RuntimeError):

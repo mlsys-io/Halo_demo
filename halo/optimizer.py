@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import re
 from typing import Any, Dict, List, Mapping, Sequence, Set, Tuple
 
+from .executor import template_level_ops
 from .optimizers.dp import DPSolver, QuerySignature, WorkerState
 from .optimizers.topo_utils import default_worker_filter
 from .utils import http_cost
@@ -266,7 +267,9 @@ class GraphOptimizer:
                 plan.metadata["scheduler_mode_resolved"] = resolved_scheduler
                 self.scheduler_mode = requested_scheduler
             self._attach_profile_metadata(plan)
-            return plan
+            # Template-level work is decided here, at compile time: operators with
+            # template-stable arguments run once per batch.
+            return replace(plan, template_level_ops=template_level_ops(graph))
 
         if self.scheduler_mode == "rr_topo":
             return _finalize_plan(self._build_rr_topo_execution_plan(
@@ -849,6 +852,7 @@ class GraphOptimizer:
             query_plans=plan.query_plans,
             selected_query_plans=plan.selected_query_plans,
             metadata=metadata,
+            template_level_ops=plan.template_level_ops,
         )
 
     def _plan_choice_score(self, choice: QueryPlanChoice) -> tuple[float, float, str]:

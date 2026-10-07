@@ -11,7 +11,7 @@ from ..db import (
     make_peer_postgres_executor,
 )
 from ..models import LLM_ENGINES, ExecutionPlan, GraphSpec, Node
-from ..executor import DBNodeExecutor, HTTPNodeExecutor, ProcessorNodeExecutor, VLLMNodeExecutor
+from ..executor import BatchMemo, DBNodeExecutor, HTTPNodeExecutor, ProcessorNodeExecutor, VLLMNodeExecutor
 from ..engines import make_llm_provider
 
 
@@ -99,6 +99,14 @@ class BaseGraphProcessor(abc.ABC):
         self.vllm_executor = VLLMNodeExecutor(engine_provider=self.engine_provider)
         self.processor_executor = ProcessorNodeExecutor()
         self.current_model: str | None = None
+        self._batch_memo = BatchMemo()
+
+    def _begin_batch(self, plan: ExecutionPlan) -> None:
+        """Bind the executors to ``plan`` (its SQL physical plans and template-level
+        operators) and start a new batch for the template-level memo."""
+        for executor in (self.db_node_executor, self.http_executor, self.processor_executor):
+            executor.bind_plan(plan, self._batch_memo)
+        self._batch_memo.reset()
 
     def _resolve_db_explain_flag(self, override: bool | None) -> bool:
         if override is not None:
