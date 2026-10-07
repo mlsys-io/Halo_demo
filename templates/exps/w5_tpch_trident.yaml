@@ -1,0 +1,455 @@
+graph:
+  name: w5_tpch_trident
+  description: >
+    Evaluation workload W5, TPCH-Trident (Fig. 5 of the paper): 7 LLM / 10 tool
+    operators (7 SQL, 2 HTTP, 1 rule processor). user_query is a TPC-H parameter
+    string such as "region=AMERICA segment=HOUSEHOLD year=1993". A deterministic
+    regex rule extracts tpch_params without an LLM call. Three entry agents each
+    run two canonical TPC-H queries (Q1+Q6, Q3+Q5, Q2+Q9); two hubs fuse them
+    with the TPC-H Q12 and Q14 reports served by a report API; a tail agent and
+    the final answer (one SQL query, Q15) close the diamond. Every SQL statement
+    and API request depends only on tpch_params. The API calls go to the local
+    mock service (scripts/mock_api.py) and are padded to Gamma-distributed
+    latencies with a 6 s mean.
+
+  nodes:
+    - id: user_input
+      type: input
+      outputs:
+        - user_query
+
+    # ===== Rule processor: regex parameter extraction (no LLM) =====
+    - id: rule_param_extractor
+      type: processor
+      processor: regex_param_extractor
+      config:
+        enums:
+          region: ["AFRICA","AMERICA","ASIA","EUROPE","MIDDLE EAST"]
+          segment: ["AUTOMOBILE","BUILDING","FURNITURE","HOUSEHOLD","MACHINERY"]
+          shipmode: ["AIR","AIR REG","RAIL","SHIP","TRUCK","MAIL","FOB"]
+          orderpriority_prefix: ["1-URGENT","2-HIGH","3-MEDIUM","4-NOT SPECIFIED","5-LOW"]
+        regex:
+          date:
+            - "(?i)\\bdate\\s*[=:]\\s*([0-9]{4}[-/][0-9]{2}[-/][0-9]{2})\\b"
+            - "(?i)\\bafter\\s+([0-9]{4}[-/][0-9]{2}[-/][0-9]{2})\\b"
+            - "(?i)\\bbefore\\s+([0-9]{4}[-/][0-9]{2}[-/][0-9]{2})\\b"
+          year:
+            - "(?i)\\byear\\s*[=:]\\s*(199[2-8])\\b"
+            - "(?i)\\b(199[2-8])\\b"
+          region:
+            - "(?i)\\bregion\\s*[=:]\\s*([A-Z][A-Z ]+?)\\b"
+            - "(?i)\\b(AF(RICA)?|AMERICA|ASIA|EUROPE|MIDDLE\\s+EAST)\\b"
+          segment:
+            - "(?i)\\bsegment\\s*[=:]\\s*(AUTOMOBILE|BUILDING|FURNITURE|HOUSEHOLD|MACHINERY)\\b"
+            - "(?i)\\b(AUTOMOBILE|BUILDING|FURNITURE|HOUSEHOLD|MACHINERY)\\b"
+          brand:
+            - "(?i)\\bbrand\\s*[=:]\\s*(Brand#[0-9]{2})\\b"
+            - "(?i)\\b(Brand#[0-9]{2})\\b"
+          type:
+            - "(?i)\\btype\\s*[=:]\\s*([A-Za-z0-9_\\- ]{3,30})\\b"
+          size:
+            - "(?i)\\bsize\\s*[=:]\\s*([0-9]{1,3})\\b"
+          shipmode:
+            - "(?i)\\bshipmode\\s*[=:]\\s*(AIR\\s+REG|AIR|RAIL|SHIP|TRUCK|MAIL|FOB)\\b"
+            - "(?i)\\b(AIR\\s+REG|AIR|RAIL|SHIP|TRUCK|MAIL|FOB)\\b"
+          shipmode2:
+            - "(?i)\\bshipmode2\\s*[=:]\\s*(AIR\\s+REG|AIR|RAIL|SHIP|TRUCK|MAIL|FOB)\\b"
+          discount_lo:
+            - "(?i)\\bdiscount\\s*[=:]\\s*([0-9]*\\.?[0-9]+)\\b"
+            - "(?i)\\bdiscount_lo\\s*[=:]\\s*([0-9]*\\.?[0-9]+)\\b"
+          discount_hi:
+            - "(?i)\\bdiscount_hi\\s*[=:]\\s*([0-9]*\\.?[0-9]+)\\b"
+          qty:
+            - "(?i)\\bqty\\s*[<=>:]\\s*([0-9]{1,4})\\b"
+            - "(?i)\\bquantity\\s*[<=>:]\\s*([0-9]{1,4})\\b"
+        defaults:
+          year: 1994
+          region: "ASIA"
+          segment: "BUILDING"
+          shipmode: "MAIL"
+          shipmode2: "SHIP"
+          date: "1995-03-15"
+          discount_lo: 0.05
+          discount_hi: 0.07
+          qty: 24
+          size: 15
+          type: "BRASS"
+          brand: "Brand#13"
+        normalize:
+          uppercase_fields: ["region","segment","shipmode","shipmode2","brand"]
+          date_fields: ["date"]
+          numeric_fields: ["year","size","qty","discount_lo","discount_hi"]
+          strip_quotes: true
+      inputs:
+        - user_query
+      outputs:
+        - tpch_params
+
+    # ===== TPC-H report API calls feeding the hubs (HTTP, mean 6 s) =====
+    - id: http_tpch_q12_shipmode
+      type: http
+      engine: http
+      url: http://127.0.0.1:8765/tpch/reports/shipmode-priority
+      method: GET
+      params:
+        shipmode: "{{ tpch_params.shipmode }}"
+        shipmode2: "{{ tpch_params.shipmode2 }}"
+        year: "{{ tpch_params.year }}"
+      latency_s: 6
+      inputs:
+        - tpch_params
+      outputs:
+        - http_tpch_q12_shipmode
+
+    - id: http_tpch_q14_promo
+      type: http
+      engine: http
+      url: http://127.0.0.1:8765/tpch/reports/promo-revenue
+      method: GET
+      params:
+        year: "{{ tpch_params.year }}"
+      latency_s: 6
+      inputs:
+        - tpch_params
+      outputs:
+        - http_tpch_q14_promo
+
+    # ===== Entry fan-out (two TPC-H SQL queries each) =====
+    - id: entry_q1_q6_lineitem
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-14B
+      db_queries:
+        - name: tpch_q1_pricing_summary
+          sql: >
+            SELECT
+              l_returnflag, l_linestatus,
+              SUM(l_quantity) AS sum_qty,
+              SUM(l_extendedprice) AS sum_base_price,
+              SUM(l_extendedprice * (1 - l_discount)) AS sum_disc_price,
+              SUM(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge,
+              AVG(l_quantity) AS avg_qty,
+              AVG(l_extendedprice) AS avg_price,
+              AVG(l_discount) AS avg_disc,
+              COUNT(*) AS count_order
+            FROM lineitem
+            WHERE l_shipdate <= (COALESCE(NULLIF(:date::text, 'sample')::date, DATE '1995-03-15') - INTERVAL '90 day')
+            GROUP BY l_returnflag, l_linestatus
+            ORDER BY l_returnflag, l_linestatus;
+          parameters:
+            date: "{{ tpch_params.date }}"
+          param_types:
+            date: date
+        - name: tpch_q6_revenue_change
+          sql: >
+            SELECT SUM(l_extendedprice * l_discount) AS revenue
+            FROM lineitem
+            WHERE l_shipdate >= make_date(:year::int, 1, 1)
+              AND l_shipdate <  make_date(:year::int, 1, 1) + INTERVAL '1 year'
+              AND l_discount BETWEEN :discount_lo::numeric AND :discount_hi::numeric
+              AND l_quantity < :qty::numeric;
+          parameters:
+            year: "{{ tpch_params.year }}"
+            discount_lo: "{{ tpch_params.discount_lo }}"
+            discount_hi: "{{ tpch_params.discount_hi }}"
+            qty: "{{ tpch_params.qty }}"
+          param_types:
+            year: int
+            discount_lo: numeric
+            discount_hi: numeric
+            qty: numeric
+      system_prompt: |
+        Entry A: summarize the TPC-H Q1 pricing summary
+        (tpch_q1_pricing_summary) and the Q6 forecast revenue change
+        (tpch_q6_revenue_change) computed for tpch_params, and connect them
+        to user_query.
+        Respond ONLY with: { "entry_lineitem_notes": "string" }
+      inputs: [user_query, tpch_params]
+      outputs: [entry_lineitem_notes]
+
+    - id: entry_q3_q5_revenue
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      db_queries:
+        - name: tpch_q3_shipping_priority
+          sql: >
+            SELECT
+              l.l_orderkey,
+              SUM(l.l_extendedprice * (1 - l.l_discount)) AS revenue,
+              o.o_orderdate,
+              o.o_shippriority
+            FROM customer c
+            JOIN orders o ON o.o_custkey = c.c_custkey
+            JOIN lineitem l ON l.l_orderkey = o.o_orderkey
+            WHERE c.c_mktsegment = :segment
+              AND o.o_orderdate < COALESCE(NULLIF(:date::text, 'sample')::date, DATE '1995-03-15')
+              AND l.l_shipdate > COALESCE(NULLIF(:date::text, 'sample')::date, DATE '1995-03-15')
+            GROUP BY l.l_orderkey, o.o_orderdate, o.o_shippriority
+            ORDER BY revenue DESC, o.o_orderdate
+            LIMIT 20;
+          parameters:
+            segment: "{{ tpch_params.segment }}"
+            date: "{{ tpch_params.date }}"
+          param_types:
+            segment: text
+            date: date
+        - name: tpch_q5_local_supplier_volume
+          sql: >
+            SELECT n.n_name AS nation,
+                   SUM(l.l_extendedprice * (1 - l.l_discount)) AS revenue
+            FROM customer c
+            JOIN orders o ON o.o_custkey = c.c_custkey
+            JOIN lineitem l ON l.l_orderkey = o.o_orderkey
+            JOIN supplier s ON s.s_suppkey = l.l_suppkey
+            JOIN nation n ON n.n_nationkey = s.s_nationkey
+            JOIN region r ON r.r_regionkey = n.n_regionkey
+            WHERE r.r_name = :region
+              AND o.o_orderdate >= make_date(:year::int, 1, 1)
+              AND o.o_orderdate <  make_date(:year::int, 1, 1) + INTERVAL '1 year'
+            GROUP BY n.n_name
+            ORDER BY revenue DESC
+            LIMIT 25;
+          parameters:
+            region: "{{ tpch_params.region }}"
+            year: "{{ tpch_params.year }}"
+          param_types:
+            region: text
+            year: int
+      system_prompt: |
+        Entry B: summarize the TPC-H Q3 shipping-priority orders
+        (tpch_q3_shipping_priority) and the Q5 local supplier volume by nation
+        (tpch_q5_local_supplier_volume) computed for tpch_params, and connect
+        them to user_query.
+        Respond ONLY with: { "entry_revenue_notes": "string" }
+      inputs: [user_query, tpch_params]
+      outputs: [entry_revenue_notes]
+
+    - id: entry_q2_q9_supply
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-32B
+      db_queries:
+        - name: tpch_q2_min_cost_supplier
+          sql: >
+            SELECT s.s_acctbal, s.s_name, n.n_name AS nation,
+                   p.p_partkey, p.p_mfgr, ps.ps_supplycost
+            FROM part p
+            JOIN partsupp ps ON ps.ps_partkey = p.p_partkey
+            JOIN supplier s ON s.s_suppkey = ps.ps_suppkey
+            JOIN nation n ON n.n_nationkey = s.s_nationkey
+            JOIN region r ON r.r_regionkey = n.n_regionkey
+            WHERE r.r_name = :region
+              AND p.p_size = :size::int
+              AND p.p_type ILIKE '%' || :type || '%'
+              AND ps.ps_supplycost = (
+                SELECT MIN(ps2.ps_supplycost)
+                FROM partsupp ps2
+                JOIN supplier s2 ON s2.s_suppkey = ps2.ps_suppkey
+                JOIN nation n2 ON n2.n_nationkey = s2.s_nationkey
+                JOIN region r2 ON r2.r_regionkey = n2.n_regionkey
+                WHERE r2.r_name = :region AND ps2.ps_partkey = p.p_partkey
+              )
+            ORDER BY s.s_acctbal DESC, n.n_name, s.s_name
+            LIMIT 20;
+          parameters:
+            region: "{{ tpch_params.region }}"
+            size: "{{ tpch_params.size }}"
+            type: "{{ tpch_params.type }}"
+          param_types:
+            region: text
+            size: int
+            type: text
+        - name: tpch_q9_profit
+          sql: >
+            SELECT n.n_name AS nation,
+                   EXTRACT(YEAR FROM o.o_orderdate)::int AS year,
+                   SUM(l.l_extendedprice * (1 - l.l_discount) - ps.ps_supplycost * l.l_quantity) AS profit
+            FROM part p
+            JOIN lineitem l ON l.l_partkey = p.p_partkey
+            JOIN orders o ON o.o_orderkey = l.l_orderkey
+            JOIN partsupp ps ON ps.ps_partkey = l.l_partkey AND ps.ps_suppkey = l.l_suppkey
+            JOIN supplier s ON s.s_suppkey = l.l_suppkey
+            JOIN nation n ON n.n_nationkey = s.s_nationkey
+            WHERE p.p_brand = :brand
+            GROUP BY n.n_name, year
+            ORDER BY nation, year
+            LIMIT 60;
+          parameters:
+            brand: "{{ tpch_params.brand }}"
+          param_types:
+            brand: text
+      system_prompt: |
+        Entry C: summarize the TPC-H Q2 minimum-cost suppliers
+        (tpch_q2_min_cost_supplier) and the Q9 profit by nation and year
+        (tpch_q9_profit) computed for tpch_params, and connect them to
+        user_query.
+        Respond ONLY with: { "entry_supply_notes": "string" }
+      inputs: [user_query, tpch_params]
+      outputs: [entry_supply_notes]
+
+    # ===== Hubs (each fed by one report API call) =====
+    - id: hub_ops_openai20b
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      system_prompt: |
+        Hub1: fuse entry_lineitem_notes and entry_revenue_notes with the TPC-H
+        Q12 report in http_tpch_q12_shipmode: for the two ship modes and the
+        year in tpch_params, one row per l_shipmode with line_count and the
+        lines of high-priority (1-URGENT, 2-HIGH) and other orders
+        (high_line_count, low_line_count), counting lines received that year
+        after their commit date and shipped before it.
+        Respond ONLY with: { "hub_ops_notes": "string" }
+      inputs: [user_query, tpch_params, entry_lineitem_notes, entry_revenue_notes, http_tpch_q12_shipmode]
+      outputs: [hub_ops_notes]
+
+    - id: hub_full_context_qwen14b
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-14B
+      system_prompt: |
+        Hub2: combine hub_ops_notes and entry_supply_notes with the TPC-H Q14
+        report in http_tpch_q14_promo: promo_revenue, the percentage of
+        revenue from promotional parts (p_type PROMO%) among lines shipped in
+        September of the tpch_params year.
+        Respond ONLY with: { "hub_full_context": "string" }
+      inputs: [user_query, tpch_params, hub_ops_notes, entry_supply_notes, http_tpch_q14_promo]
+      outputs: [hub_full_context]
+
+    # ===== Tail (32B, no tools) =====
+    - id: tail_focus_qwen32b
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-32B
+      system_prompt: |
+        Tail: based on hub_full_context, recommend 4-6 next TPC-H queries to run
+        and which params to refine.
+        Respond ONLY with: { "tail_focus_notes": "string" }
+      inputs: [user_query, hub_full_context]
+      outputs: [tail_focus_notes]
+
+    # ===== Final answer (20B, one SQL query) =====
+    - id: tpch_final_answer
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      db_queries:
+        - name: tpch_q15_top_supplier
+          sql: >
+            WITH revenue0 AS (
+              SELECT l.l_suppkey AS supplier_no,
+                     SUM(l.l_extendedprice * (1 - l.l_discount)) AS total_revenue
+              FROM lineitem l
+              WHERE l.l_shipdate >= make_date(:year::int, 1, 1)
+                AND l.l_shipdate <  make_date(:year::int, 4, 1)
+              GROUP BY l.l_suppkey
+            )
+            SELECT s.s_suppkey, s.s_name, r.total_revenue
+            FROM supplier s
+            JOIN revenue0 r ON r.supplier_no = s.s_suppkey
+            WHERE r.total_revenue = (SELECT MAX(total_revenue) FROM revenue0)
+            ORDER BY s.s_suppkey;
+          parameters:
+            year: "{{ tpch_params.year }}"
+          param_types:
+            year: int
+      system_prompt: |
+        Final: use tpch_params, hub_full_context, tail_focus_notes, and the
+        TPC-H Q15 top supplier (tpch_q15_top_supplier) to produce a
+        final_answer grounded in the DB results.
+        Respond ONLY with: { "final_answer": "string" }
+      inputs: [user_query, tpch_params, hub_full_context, tail_focus_notes]
+      outputs: [final_answer]
+
+  edges:
+    - from: user_input
+      to: rule_param_extractor
+      mapping:
+        user_query: "{{ user_query }}"
+
+    - from: rule_param_extractor
+      to: http_tpch_q12_shipmode
+      mapping:
+        tpch_params: "{{ tpch_params }}"
+
+    - from: rule_param_extractor
+      to: http_tpch_q14_promo
+      mapping:
+        tpch_params: "{{ tpch_params }}"
+
+    - from: rule_param_extractor
+      to: entry_q1_q6_lineitem
+      mapping:
+        user_query: "{{ user_query }}"
+        tpch_params: "{{ tpch_params }}"
+
+    - from: rule_param_extractor
+      to: entry_q3_q5_revenue
+      mapping:
+        user_query: "{{ user_query }}"
+        tpch_params: "{{ tpch_params }}"
+
+    - from: rule_param_extractor
+      to: entry_q2_q9_supply
+      mapping:
+        user_query: "{{ user_query }}"
+        tpch_params: "{{ tpch_params }}"
+
+    - from: entry_q1_q6_lineitem
+      to: hub_ops_openai20b
+      mapping:
+        user_query: "{{ user_query }}"
+        tpch_params: "{{ tpch_params }}"
+        entry_lineitem_notes: "{{ entry_lineitem_notes }}"
+
+    - from: entry_q3_q5_revenue
+      to: hub_ops_openai20b
+      mapping:
+        user_query: "{{ user_query }}"
+        tpch_params: "{{ tpch_params }}"
+        entry_revenue_notes: "{{ entry_revenue_notes }}"
+
+    - from: http_tpch_q12_shipmode
+      to: hub_ops_openai20b
+      mapping:
+        http_tpch_q12_shipmode: "{{ http_tpch_q12_shipmode }}"
+
+    - from: hub_ops_openai20b
+      to: hub_full_context_qwen14b
+      mapping:
+        user_query: "{{ user_query }}"
+        tpch_params: "{{ tpch_params }}"
+        hub_ops_notes: "{{ hub_ops_notes }}"
+
+    - from: entry_q2_q9_supply
+      to: hub_full_context_qwen14b
+      mapping:
+        user_query: "{{ user_query }}"
+        tpch_params: "{{ tpch_params }}"
+        entry_supply_notes: "{{ entry_supply_notes }}"
+
+    - from: http_tpch_q14_promo
+      to: hub_full_context_qwen14b
+      mapping:
+        http_tpch_q14_promo: "{{ http_tpch_q14_promo }}"
+
+    - from: hub_full_context_qwen14b
+      to: tail_focus_qwen32b
+      mapping:
+        user_query: "{{ user_query }}"
+        hub_full_context: "{{ hub_full_context }}"
+
+    - from: hub_full_context_qwen14b
+      to: tpch_final_answer
+      mapping:
+        user_query: "{{ user_query }}"
+        tpch_params: "{{ tpch_params }}"
+        hub_full_context: "{{ hub_full_context }}"
+
+    - from: tail_focus_qwen32b
+      to: tpch_final_answer
+      mapping:
+        user_query: "{{ user_query }}"
+        tpch_params: "{{ tpch_params }}"
+        tail_focus_notes: "{{ tail_focus_notes }}"

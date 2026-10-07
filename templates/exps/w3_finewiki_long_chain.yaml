@@ -1,0 +1,387 @@
+graph:
+  name: w3_finewiki_long_chain
+  description: >
+    Evaluation workload W3, FineWiki-LongChain (Fig. 5 of the paper): 9 LLM / 6
+    tool operators (4 SQL, 2 HTTP). user_query is a Wikipedia article title. A
+    long main chain (20B: global topic expander, two timeline refiners)
+    progressively refines a topic summary over full-text and title SQL
+    retrievals, while a category branch (32B) and a link branch (14B) are fed by
+    Wikipedia category and outbound-link API calls. A query rewriter (20B) and a
+    final summarizer (14B, one SQL retrieval) fuse everything. Every SQL statement
+    and API request depends only on user_query. The API calls go to the local
+    mock service (scripts/mock_api.py) and are padded to Gamma-distributed
+    latencies with a 3 s mean.
+
+  nodes:
+    - id: user_input
+      type: input
+      outputs:
+        - user_query
+
+    # ===== Wikipedia category and outbound-link API calls (HTTP, mean 3 s) =====
+    - id: http_fw_category_pages
+      type: http
+      engine: http
+      url: http://127.0.0.1:8765/finewiki/categories
+      method: GET
+      params:
+        topic: "{{ user_query }}"
+        limit: 30
+      latency_s: 3
+      inputs:
+        - user_query
+      outputs:
+        - http_fw_category_pages
+
+    - id: http_fw_outbound_links
+      type: http
+      engine: http
+      url: http://127.0.0.1:8765/finewiki/outbound-links
+      method: GET
+      params:
+        topic: "{{ user_query }}"
+        limit: 40
+      latency_s: 3
+      inputs:
+        - user_query
+      outputs:
+        - http_fw_outbound_links
+
+    # ===== Main chain (20B): topic expander and two timeline refiners =====
+    - id: global_topic_expander
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      db_queries:
+        - name: fw_global_wikitext_fulltext
+          sql: >
+            SELECT page_id, title, url, wikitext
+            FROM pages
+            WHERE in_language = 'en'
+              AND to_tsvector('english', coalesce(wikitext, ''))
+                  @@ plainto_tsquery('english', :keyword)
+            ORDER BY date_modified DESC
+            LIMIT 40;
+          parameters:
+            keyword: "{{ user_query }}"
+        - name: fw_global_title_keyword
+          sql: >
+            SELECT page_id, title, url, wikitext
+            FROM pages
+            WHERE in_language = 'en'
+              AND title ILIKE '%%' || :keyword || '%%'
+            ORDER BY date_modified DESC
+            LIMIT 25;
+          parameters:
+            keyword: "{{ user_query }}"
+      system_prompt: |
+        You are a global topic expander over a Wikipedia-like corpus.
+        Use fw_global_wikitext_fulltext (recently modified pages whose text
+        matches user_query) and fw_global_title_keyword (pages whose title
+        contains user_query) to build a broad but coherent summary of the
+        topic and propose a small list of central candidate page_ids (as
+        plain integers).
+        Respond ONLY with:
+        {
+          "global_summary": "string",
+          "central_page_ids": [integer, ...]
+        }
+      inputs:
+        - user_query
+      outputs:
+        - global_summary
+        - central_page_ids
+
+    - id: timeline_refiner_1
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      db_queries:
+        - name: fw_timeline_from_keyword
+          sql: >
+            SELECT page_id, title, url, wikitext, date_modified
+            FROM pages
+            WHERE in_language = 'en'
+              AND to_tsvector('english', coalesce(wikitext, ''))
+                  @@ plainto_tsquery('english', :keyword)
+            ORDER BY date_modified ASC
+            LIMIT 40;
+          parameters:
+            keyword: "{{ user_query }}"
+      system_prompt: |
+        You are a timeline-focused refiner.
+        Given global_summary and central_page_ids, and using
+        fw_timeline_from_keyword (matching pages, oldest modification first)
+        as context, construct a coarse chronological narrative of the topic.
+        Respond ONLY with:
+        {
+          "coarse_timeline": "string"
+        }
+      inputs:
+        - user_query
+        - global_summary
+        - central_page_ids
+      outputs:
+        - coarse_timeline
+
+    - id: timeline_refiner_2
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      system_prompt: |
+        You are a second-pass timeline refiner.
+        Take coarse_timeline, improve its clarity and ordering, and
+        highlight 3-5 key milestones.
+        Respond ONLY with:
+        {
+          "refined_timeline": "string"
+        }
+      inputs:
+        - user_query
+        - coarse_timeline
+      outputs:
+        - refined_timeline
+
+    # ===== Category branch (32B, fed by the category API) =====
+    - id: category_overview
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-32B
+      system_prompt: |
+        You are a category-focused summarizer.
+        http_fw_category_pages is the Wikipedia category API's answer for
+        user_query: the categories that the matching articles belong to,
+        most shared first, each with its title, member_count, and
+        member_pages (the matching articles in that category).
+        Use it to provide a high-level taxonomy of the topic.
+        Respond ONLY with:
+        {
+          "category_overview": "string"
+        }
+      inputs:
+        - user_query
+        - http_fw_category_pages
+      outputs:
+        - category_overview
+
+    - id: category_drilldown
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-32B
+      system_prompt: |
+        You are a drill-down assistant for category structures.
+        Take category_overview and extract 3-5 important subtopics that
+        should be mentioned in a final answer.
+        Respond ONLY with:
+        {
+          "category_details": ["string", ...]
+        }
+      inputs:
+        - user_query
+        - category_overview
+      outputs:
+        - category_details
+
+    # ===== Link branch (14B, fed by the outbound-link API) =====
+    - id: outbound_link_view
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-14B
+      system_prompt: |
+        You are an outbound link summarizer.
+        http_fw_outbound_links is the Wikipedia link API's answer for
+        user_query: the articles whose title contains user_query, each with
+        the article titles it links to (outbound_links, in page order) and
+        its total outbound_link_count.
+        Summarize which topics these pages tend to link out to.
+        Respond ONLY with:
+        {
+          "outbound_links_overview": "string"
+        }
+      inputs:
+        - user_query
+        - http_fw_outbound_links
+      outputs:
+        - outbound_links_overview
+
+    - id: inbound_link_view
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-14B
+      system_prompt: |
+        You summarize who links into this topic.
+        Given outbound_links_overview and global_summary, infer which
+        other pages or domains frequently point to this topic and why
+        that matters for understanding it.
+        Respond ONLY with:
+        {
+          "inbound_links_overview": "string"
+        }
+      inputs:
+        - user_query
+        - outbound_links_overview
+        - global_summary
+      outputs:
+        - inbound_links_overview
+
+    # ===== Query rewriter (20B) + final summarizer (14B) =====
+    - id: narrow_focus_rewriter
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      system_prompt: |
+        You rewrite user_query into a narrower focus question
+        suitable for a final answer over this topic.
+        Respond ONLY with:
+        {
+          "narrowed_query": "string"
+        }
+      inputs:
+        - user_query
+      outputs:
+        - narrowed_query
+
+    - id: final_answer_summarizer
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-14B
+      db_queries:
+        - name: fw_supporting_snippets_global
+          sql: >
+            SELECT page_id, title, url, wikitext
+            FROM pages
+            WHERE in_language = 'en'
+              AND to_tsvector('english', coalesce(wikitext, ''))
+                  @@ plainto_tsquery('english', :keyword)
+            ORDER BY date_modified DESC
+            LIMIT 20;
+          parameters:
+            keyword: "{{ user_query }}"
+      system_prompt: |
+        You are the final answer assistant.
+        Combine global_summary, refined_timeline, category_details,
+        outbound_links_overview, inbound_links_overview, and
+        narrowed_query (plus fw_supporting_snippets_global as loose
+        background) into a single clear, grounded answer.
+        Respond ONLY with:
+        {
+          "final_answer": "string"
+        }
+      inputs:
+        - user_query
+        - global_summary
+        - refined_timeline
+        - category_details
+        - outbound_links_overview
+        - inbound_links_overview
+        - narrowed_query
+      outputs:
+        - final_answer
+
+  edges:
+    - from: user_input
+      to: global_topic_expander
+      mapping:
+        user_query: "{{ user_query }}"
+
+    - from: user_input
+      to: http_fw_category_pages
+      mapping:
+        user_query: "{{ user_query }}"
+
+    - from: user_input
+      to: http_fw_outbound_links
+      mapping:
+        user_query: "{{ user_query }}"
+
+    - from: user_input
+      to: category_overview
+      mapping:
+        user_query: "{{ user_query }}"
+
+    - from: http_fw_category_pages
+      to: category_overview
+      mapping:
+        http_fw_category_pages: "{{ http_fw_category_pages }}"
+
+    - from: user_input
+      to: outbound_link_view
+      mapping:
+        user_query: "{{ user_query }}"
+
+    - from: http_fw_outbound_links
+      to: outbound_link_view
+      mapping:
+        http_fw_outbound_links: "{{ http_fw_outbound_links }}"
+
+    - from: user_input
+      to: narrow_focus_rewriter
+      mapping:
+        user_query: "{{ user_query }}"
+
+    - from: global_topic_expander
+      to: timeline_refiner_1
+      mapping:
+        user_query: "{{ user_query }}"
+        global_summary: "{{ global_summary }}"
+        central_page_ids: "{{ central_page_ids }}"
+
+    - from: timeline_refiner_1
+      to: timeline_refiner_2
+      mapping:
+        user_query: "{{ user_query }}"
+        coarse_timeline: "{{ coarse_timeline }}"
+
+    - from: category_overview
+      to: category_drilldown
+      mapping:
+        user_query: "{{ user_query }}"
+        category_overview: "{{ category_overview }}"
+
+    - from: outbound_link_view
+      to: inbound_link_view
+      mapping:
+        user_query: "{{ user_query }}"
+        outbound_links_overview: "{{ outbound_links_overview }}"
+
+    - from: global_topic_expander
+      to: inbound_link_view
+      mapping:
+        user_query: "{{ user_query }}"
+        global_summary: "{{ global_summary }}"
+
+    - from: global_topic_expander
+      to: final_answer_summarizer
+      mapping:
+        user_query: "{{ user_query }}"
+        global_summary: "{{ global_summary }}"
+
+    - from: timeline_refiner_2
+      to: final_answer_summarizer
+      mapping:
+        user_query: "{{ user_query }}"
+        refined_timeline: "{{ refined_timeline }}"
+
+    - from: category_drilldown
+      to: final_answer_summarizer
+      mapping:
+        user_query: "{{ user_query }}"
+        category_details: "{{ category_details }}"
+
+    - from: outbound_link_view
+      to: final_answer_summarizer
+      mapping:
+        user_query: "{{ user_query }}"
+        outbound_links_overview: "{{ outbound_links_overview }}"
+
+    - from: inbound_link_view
+      to: final_answer_summarizer
+      mapping:
+        user_query: "{{ user_query }}"
+        inbound_links_overview: "{{ inbound_links_overview }}"
+
+    - from: narrow_focus_rewriter
+      to: final_answer_summarizer
+      mapping:
+        user_query: "{{ user_query }}"
+        narrowed_query: "{{ narrowed_query }}"

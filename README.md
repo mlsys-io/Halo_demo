@@ -110,9 +110,11 @@ standalone tool nodes, just like `db_queries`.
 An HTTP node that declares a `url` (with optional `method`, `params`, `headers`,
 `json`/`body`, `timeout_s`, and a `response_path` such as
 `choices.0.message.content`) issues that request live, so an API-served LLM runs
-as an opaque HTTP operator whose profiled latency enters the plan. An HTTP node
-that declares a latency (`sleep_s`, `latency_ms`, ...) is served by latency
-injection instead, as in the paper's experiments. A graph-level `loops` entry
+as an opaque HTTP operator whose profiled latency enters the plan. Adding
+`latency_s` (or `latency_ms`) keeps the request but pads each call to a
+Gamma-distributed latency with that mean, sleeping only for the remainder. An HTTP
+node that declares `sleep_s` (or `sleep_ms`) is served by latency injection alone,
+as in the paper's experiments, and never contacts its `url`. A graph-level `loops` entry
 (e.g. `{nodes: [writer, critic], max_iterations: 3}`) unrolls a bounded loop into
 a static DAG; edges that point backwards in the listed order link each iteration
 to the next.
@@ -152,6 +154,13 @@ model weights for the `vllm`/`sglang` nodes. With `plan_mode="profiled"` and `db
 present, planning also profiles SQL via `EXPLAIN`, which requires Postgres.
 Before planning, HTTP and local-function nodes are invoked on the sample
 contexts and timed; the DP planner uses the mean latency as their cost.
+
+## Evaluation workloads
+`templates/exps/` holds the paper's six evaluation templates (W1–W6) over IMDb,
+FineWiki, and TPC-H. Their HTTP operators call a local mock API,
+`scripts/mock_api.py`, which answers from the same Postgres databases; see
+[`templates/exps/README.md`](templates/exps/README.md) for the data setup, the
+operators, and how to run a template.
 
 ## Citation
 If you find this project useful, please consider citing our work:

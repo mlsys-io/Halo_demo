@@ -1,0 +1,308 @@
+graph:
+  name: w4_finewiki_bridge
+  description: >
+    Evaluation workload W4, FineWiki-Bridge (Fig. 5 of the paper): 9 LLM / 3
+    tool operators (2 SQL, 1 HTTP). user_query is a Wikipedia article title. A
+    long main chain (20B: a0, a1, a2) is bridged by a category branch (32B: b1,
+    b2) fed by a Wikipedia category API call and by a language branch (14B: c1,
+    c2) with one SQL retrieval over non-English pages; a light sampler and the
+    final head (14B) fuse the three. Every SQL statement and the API request
+    depend only on user_query. The API call goes to the local mock service
+    (scripts/mock_api.py) and is padded to a Gamma-distributed latency with a
+    3 s mean.
+
+  nodes:
+    - id: user_input
+      type: input
+      outputs:
+        - user_query
+
+    # ===== Wikipedia category API call feeding the category bridge (HTTP, mean 3 s) =====
+    - id: http_fw_category_pages
+      type: http
+      engine: http
+      url: http://127.0.0.1:8765/finewiki/categories
+      method: GET
+      params:
+        topic: "{{ user_query }}"
+        limit: 20
+      latency_s: 3
+      inputs:
+        - user_query
+      outputs:
+        - http_fw_category_pages
+
+    # ===== Main chain (20B): a0 -> a1 -> a2 =====
+    - id: fw_global_pass_a0
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      db_queries:
+        - name: fw_global_pass_a0_main
+          sql: >
+            SELECT page_id, title, url, wikitext
+            FROM pages
+            WHERE in_language = 'en'
+              AND to_tsvector('english', coalesce(wikitext,''))
+                  @@ plainto_tsquery('english', :keyword)
+            LIMIT 30;
+          parameters:
+            keyword: "{{ user_query }}"
+          param_types:
+            keyword: text
+      system_prompt: |
+        First global pass over FineWiki for the topic in user_query.
+        Use fw_global_pass_a0_main (English pages whose text matches
+        user_query) as your retrieval pool.
+        Respond ONLY with:
+        {
+          "a0_summary": "string"
+        }
+      inputs:
+        - user_query
+      outputs:
+        - a0_summary
+
+    - id: fw_global_pass_a1
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      system_prompt: |
+        Refine a0_summary into a structured outline.
+        Respond ONLY with:
+        {
+          "a1_outline": "string"
+        }
+      inputs:
+        - user_query
+        - a0_summary
+      outputs:
+        - a1_outline
+
+    - id: fw_global_pass_a2
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      system_prompt: |
+        Expand a1_outline into a longer narrative suitable for
+        downstream bridges and final answering.
+        Respond ONLY with:
+        {
+          "a2_narrative": "string"
+        }
+      inputs:
+        - user_query
+        - a1_outline
+      outputs:
+        - a2_narrative
+
+    # ===== Category bridge (32B): b1 (fed by the category API) -> b2 =====
+    - id: fw_category_bridge_b1
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-32B
+      system_prompt: |
+        Category-based bridge: connect a1_outline with the Wikipedia
+        categories in http_fw_category_pages, the category API's answer for
+        user_query (the categories of the matching articles, most shared
+        first, each with its title, member_count, and member_pages).
+        Respond ONLY with:
+        {
+          "b1_bridge_notes": "string"
+        }
+      inputs:
+        - user_query
+        - a1_outline
+        - http_fw_category_pages
+      outputs:
+        - b1_bridge_notes
+
+    - id: fw_category_bridge_b2
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-32B
+      system_prompt: |
+        Refine b1_bridge_notes into 3-5 key subtopics that are useful
+        for guiding the final answer.
+        Respond ONLY with:
+        {
+          "b2_key_subtopics": ["string", ...]
+        }
+      inputs:
+        - user_query
+        - b1_bridge_notes
+      outputs:
+        - b2_key_subtopics
+
+    # ===== Language bridge (14B): c1 (one SQL retrieval) -> c2 =====
+    - id: fw_language_bridge_c1
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-14B
+      db_queries:
+        - name: fw_language_bridge_c1_main
+          sql: >
+            SELECT page_id, title, url, wikitext, in_language
+            FROM pages
+            WHERE in_language <> 'en'
+              AND to_tsvector('simple', coalesce(wikitext,''))
+                  @@ plainto_tsquery('simple', :keyword)
+            LIMIT 40;
+          parameters:
+            keyword: "{{ user_query }}"
+          param_types:
+            keyword: text
+      system_prompt: |
+        Non-English language bridge for the topic.
+        Starting from a0_summary, use fw_language_bridge_c1_main (non-English
+        pages whose text matches user_query) to understand how the topic
+        appears in other languages.
+        Respond ONLY with:
+        {
+          "c1_language_notes": "string"
+        }
+      inputs:
+        - user_query
+        - a0_summary
+      outputs:
+        - c1_language_notes
+
+    - id: fw_language_bridge_c2
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-14B
+      system_prompt: |
+        Refine c1_language_notes into 2-4 concise cross-lingual
+        insights that can influence the final answer.
+        Respond ONLY with:
+        {
+          "c2_crosslingual_insights": "string"
+        }
+      inputs:
+        - user_query
+        - c1_language_notes
+      outputs:
+        - c2_crosslingual_insights
+
+    # ===== Light sampler + final answer (14B) =====
+    - id: fw_light_sampler_s0
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-14B
+      system_prompt: |
+        Light sampler for the bridge topology.
+        Condense a2_narrative, b2_key_subtopics, and
+        c2_crosslingual_insights into short hints that are easy for
+        the final answer head to consume.
+        Respond ONLY with:
+        {
+          "s0_hints": ["string", ...]
+        }
+      inputs:
+        - user_query
+        - a2_narrative
+        - b2_key_subtopics
+        - c2_crosslingual_insights
+      outputs:
+        - s0_hints
+
+    - id: fw_final_answer_bridge
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-14B
+      system_prompt: |
+        Final answer assistant for the bridge topology.
+        Combine a2_narrative and s0_hints into a single coherent,
+        well-structured answer to user_query.
+        Respond ONLY with:
+        {
+          "final_answer": "string"
+        }
+      inputs:
+        - user_query
+        - a2_narrative
+        - s0_hints
+      outputs:
+        - final_answer
+
+  edges:
+    - from: user_input
+      to: fw_global_pass_a0
+      mapping:
+        user_query: "{{ user_query }}"
+
+    - from: user_input
+      to: http_fw_category_pages
+      mapping:
+        user_query: "{{ user_query }}"
+
+    - from: fw_global_pass_a0
+      to: fw_global_pass_a1
+      mapping:
+        user_query: "{{ user_query }}"
+        a0_summary: "{{ a0_summary }}"
+
+    - from: fw_global_pass_a1
+      to: fw_global_pass_a2
+      mapping:
+        user_query: "{{ user_query }}"
+        a1_outline: "{{ a1_outline }}"
+
+    - from: fw_global_pass_a1
+      to: fw_category_bridge_b1
+      mapping:
+        user_query: "{{ user_query }}"
+        a1_outline: "{{ a1_outline }}"
+
+    - from: http_fw_category_pages
+      to: fw_category_bridge_b1
+      mapping:
+        http_fw_category_pages: "{{ http_fw_category_pages }}"
+
+    - from: fw_category_bridge_b1
+      to: fw_category_bridge_b2
+      mapping:
+        user_query: "{{ user_query }}"
+        b1_bridge_notes: "{{ b1_bridge_notes }}"
+
+    - from: fw_global_pass_a0
+      to: fw_language_bridge_c1
+      mapping:
+        user_query: "{{ user_query }}"
+        a0_summary: "{{ a0_summary }}"
+
+    - from: fw_language_bridge_c1
+      to: fw_language_bridge_c2
+      mapping:
+        user_query: "{{ user_query }}"
+        c1_language_notes: "{{ c1_language_notes }}"
+
+    - from: fw_global_pass_a2
+      to: fw_light_sampler_s0
+      mapping:
+        user_query: "{{ user_query }}"
+        a2_narrative: "{{ a2_narrative }}"
+
+    - from: fw_category_bridge_b2
+      to: fw_light_sampler_s0
+      mapping:
+        user_query: "{{ user_query }}"
+        b2_key_subtopics: "{{ b2_key_subtopics }}"
+
+    - from: fw_language_bridge_c2
+      to: fw_light_sampler_s0
+      mapping:
+        user_query: "{{ user_query }}"
+        c2_crosslingual_insights: "{{ c2_crosslingual_insights }}"
+
+    - from: fw_global_pass_a2
+      to: fw_final_answer_bridge
+      mapping:
+        user_query: "{{ user_query }}"
+        a2_narrative: "{{ a2_narrative }}"
+
+    - from: fw_light_sampler_s0
+      to: fw_final_answer_bridge
+      mapping:
+        user_query: "{{ user_query }}"
+        s0_hints: "{{ s0_hints }}"

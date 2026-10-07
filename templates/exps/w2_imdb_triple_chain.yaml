@@ -1,0 +1,374 @@
+graph:
+  name: w2_imdb_triple_chain
+  description: >
+    Evaluation workload W2, IMDb-TripleChain (Fig. 5 of the paper): 10 LLM / 3
+    tool operators (2 SQL, 1 HTTP). A keyword planner roots three parallel
+    chains, each pinned to one model: movies (32B, one SQL lookup), people (20B,
+    one movie-metadata API call), and crew (14B, one SQL lookup). A sanity
+    checker rewrites the question in parallel, and a final head merges the three
+    chains. Every SQL statement and the API request depend only on
+    search_keyword. The API call goes to the local mock service
+    (scripts/mock_api.py) and is padded to a Gamma-distributed latency with a
+    3 s mean.
+
+  nodes:
+    - id: user_input
+      type: input
+      outputs:
+        - user_query
+
+    # ===== Root: keyword planner (20B, no tools) =====
+    - id: keyword_planner
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      system_prompt: |
+        You are a keyword planning assistant for an IMDb-like database.
+        Given user_query, produce a concise search_keyword suitable for ILIKE
+        on titles, names, and related text fields.
+        Respond ONLY with:
+        {
+          "search_keyword": "string"
+        }
+      inputs:
+        - user_query
+      outputs:
+        - search_keyword
+
+    # ===== Movie-metadata API call feeding the people chain (HTTP, mean 3 s) =====
+    - id: http_people_overview
+      type: http
+      engine: http
+      url: http://127.0.0.1:8765/imdb/people/search
+      method: GET
+      params:
+        keyword: "{{ search_keyword }}"
+        limit: 40
+      latency_s: 3
+      inputs:
+        - search_keyword
+      outputs:
+        - http_people_overview
+
+    # ===== Movie chain (32B, one SQL lookup) =====
+    - id: movie_overview_qwen32b
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-32B
+      db_queries:
+        - name: imdb_movie_overview_main
+          sql: >
+            SELECT
+              b.tconst,
+              b.primary_title,
+              b.original_title,
+              b.start_year,
+              b.genres,
+              r.average_rating,
+              r.num_votes
+            FROM title_basics AS b
+            LEFT JOIN title_ratings AS r
+              ON r.tconst = b.tconst
+            WHERE
+              b.title_type IN ('movie','tvMovie','tvSeries')
+              AND (
+                b.primary_title     ILIKE '%%' || :keyword || '%%'
+                OR b.original_title ILIKE '%%' || :keyword || '%%'
+              )
+            ORDER BY COALESCE(r.num_votes,0)     DESC,
+                     COALESCE(r.average_rating,0) DESC,
+                     b.start_year DESC NULLS LAST
+            LIMIT 40;
+          parameters:
+            keyword: "{{ search_keyword }}"
+          param_types:
+            keyword: text
+      system_prompt: |
+        Movie chain: overview.
+        Use the rows of imdb_movie_overview_main (titles matching
+        search_keyword, most-voted first) to identify candidate titles and
+        describe the overall landscape.
+        Respond ONLY with:
+        {
+          "movie_overview": "string"
+        }
+      inputs:
+        - user_query
+        - search_keyword
+      outputs:
+        - movie_overview
+
+    - id: movie_final_notes_qwen32b
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-32B
+      system_prompt: |
+        Movie chain: final notes.
+        Based on movie_overview, highlight 3-5 representative titles and
+        explain why they matter for user_query.
+        Respond ONLY with:
+        {
+          "movie_final_notes": "string"
+        }
+      inputs:
+        - user_query
+        - movie_overview
+      outputs:
+        - movie_final_notes
+
+    # ===== People chain (20B, fed by the people-search API) =====
+    - id: people_overview_openai20b
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      system_prompt: |
+        People chain: overview.
+        http_people_overview is the movie-metadata API's people search:
+        people whose name contains search_keyword, in name order, with
+        nconst, primary_name, primary_profession (e.g. actor, director,
+        writer), and known_for_titles (title IDs).
+        Use it to summarize which actors, directors, and writers are most
+        relevant to search_keyword.
+        Respond ONLY with:
+        {
+          "people_overview": "string"
+        }
+      inputs:
+        - user_query
+        - search_keyword
+        - http_people_overview
+      outputs:
+        - people_overview
+
+    - id: people_final_notes_openai20b
+      type: inference
+      engine: vllm
+      model: openai/gpt-oss-20b
+      system_prompt: |
+        People chain: final notes.
+        From people_overview, explain which people are most central to
+        answering user_query, and why.
+        Respond ONLY with:
+        {
+          "people_final_notes": "string"
+        }
+      inputs:
+        - user_query
+        - people_overview
+      outputs:
+        - people_final_notes
+
+    # ===== Crew chain (14B, one SQL lookup) =====
+    - id: crew_overview_qwen14b
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-14B
+      db_queries:
+        - name: imdb_crew_by_title_keyword
+          sql: >
+            SELECT
+              b.tconst,
+              b.primary_title,
+              b.start_year,
+              c.directors,
+              c.writers
+            FROM title_basics AS b
+            JOIN title_crew AS c
+              ON c.tconst = b.tconst
+            WHERE
+              b.title_type IN ('movie','tvMovie','tvSeries')
+              AND (
+                b.primary_title     ILIKE '%%' || :keyword || '%%'
+                OR b.original_title ILIKE '%%' || :keyword || '%%'
+              )
+            ORDER BY b.start_year DESC NULLS LAST
+            LIMIT 40;
+          parameters:
+            keyword: "{{ search_keyword }}"
+          param_types:
+            keyword: text
+      system_prompt: |
+        Crew chain: overview.
+        Use imdb_crew_by_title_keyword (titles matching search_keyword with
+        their director and writer IDs, newest first) to summarize typical
+        directors/writers and crew patterns relevant to search_keyword.
+        Respond ONLY with:
+        {
+          "crew_overview": "string"
+        }
+      inputs:
+        - user_query
+        - search_keyword
+      outputs:
+        - crew_overview
+
+    - id: crew_insights_qwen14b
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-14B
+      system_prompt: |
+        Crew chain: mid-level insights.
+        Turn crew_overview into a few concrete, human-readable insights
+        about directing/writing styles that matter for user_query.
+        Respond ONLY with:
+        {
+          "crew_insights": "string"
+        }
+      inputs:
+        - user_query
+        - crew_overview
+      outputs:
+        - crew_insights
+
+    - id: crew_final_notes_qwen14b
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-14B
+      system_prompt: |
+        Crew chain: final notes.
+        From crew_insights, produce crew-centric final notes that the final
+        head can consume, focusing on how directors/writers shape the
+        interpretation of the titles for user_query.
+        Respond ONLY with:
+        {
+          "crew_final_notes": "string"
+        }
+      inputs:
+        - user_query
+        - crew_insights
+      outputs:
+        - crew_final_notes
+
+    # ===== Sanity check (32B) + final merge head (14B) =====
+    - id: small_sanity_check_qwen32b
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-32B
+      system_prompt: |
+        You are a lightweight sanity checker.
+        Rewrite user_query into a shorter, unambiguous canonical_query.
+        Respond ONLY with:
+        {
+          "canonical_query": "string"
+        }
+      inputs:
+        - user_query
+      outputs:
+        - canonical_query
+
+    - id: final_answer_qwen14b
+      type: inference
+      engine: vllm
+      model: Qwen/Qwen3-14B
+      system_prompt: |
+        Final answer assistant.
+        Combine movie_final_notes, people_final_notes, crew_final_notes,
+        and canonical_query (with search_keyword for reference) into a
+        single clear, grounded answer to user_query.
+        Respond ONLY with:
+        {
+          "final_answer": "string"
+        }
+      inputs:
+        - user_query
+        - search_keyword
+        - canonical_query
+        - movie_final_notes
+        - people_final_notes
+        - crew_final_notes
+      outputs:
+        - final_answer
+
+  edges:
+    - from: user_input
+      to: keyword_planner
+      mapping:
+        user_query: "{{ user_query }}"
+
+    - from: user_input
+      to: small_sanity_check_qwen32b
+      mapping:
+        user_query: "{{ user_query }}"
+
+    - from: keyword_planner
+      to: http_people_overview
+      mapping:
+        search_keyword: "{{ search_keyword }}"
+
+    - from: keyword_planner
+      to: movie_overview_qwen32b
+      mapping:
+        user_query: "{{ user_query }}"
+        search_keyword: "{{ search_keyword }}"
+
+    - from: keyword_planner
+      to: people_overview_openai20b
+      mapping:
+        user_query: "{{ user_query }}"
+        search_keyword: "{{ search_keyword }}"
+
+    - from: http_people_overview
+      to: people_overview_openai20b
+      mapping:
+        http_people_overview: "{{ http_people_overview }}"
+
+    - from: keyword_planner
+      to: crew_overview_qwen14b
+      mapping:
+        user_query: "{{ user_query }}"
+        search_keyword: "{{ search_keyword }}"
+
+    # Direct edge carrying search_keyword to the final head (not drawn in Fig. 5).
+    - from: keyword_planner
+      to: final_answer_qwen14b
+      mapping:
+        user_query: "{{ user_query }}"
+        search_keyword: "{{ search_keyword }}"
+
+    - from: movie_overview_qwen32b
+      to: movie_final_notes_qwen32b
+      mapping:
+        user_query: "{{ user_query }}"
+        movie_overview: "{{ movie_overview }}"
+
+    - from: people_overview_openai20b
+      to: people_final_notes_openai20b
+      mapping:
+        user_query: "{{ user_query }}"
+        people_overview: "{{ people_overview }}"
+
+    - from: crew_overview_qwen14b
+      to: crew_insights_qwen14b
+      mapping:
+        user_query: "{{ user_query }}"
+        crew_overview: "{{ crew_overview }}"
+
+    - from: crew_insights_qwen14b
+      to: crew_final_notes_qwen14b
+      mapping:
+        user_query: "{{ user_query }}"
+        crew_insights: "{{ crew_insights }}"
+
+    - from: small_sanity_check_qwen32b
+      to: final_answer_qwen14b
+      mapping:
+        user_query: "{{ user_query }}"
+        canonical_query: "{{ canonical_query }}"
+
+    - from: movie_final_notes_qwen32b
+      to: final_answer_qwen14b
+      mapping:
+        user_query: "{{ user_query }}"
+        movie_final_notes: "{{ movie_final_notes }}"
+
+    - from: people_final_notes_openai20b
+      to: final_answer_qwen14b
+      mapping:
+        user_query: "{{ user_query }}"
+        people_final_notes: "{{ people_final_notes }}"
+
+    - from: crew_final_notes_qwen14b
+      to: final_answer_qwen14b
+      mapping:
+        user_query: "{{ user_query }}"
+        crew_final_notes: "{{ crew_final_notes }}"
